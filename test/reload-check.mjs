@@ -675,13 +675,25 @@ async function main() {
   // -reload-interval 0 hands control to SIGHUP. On a platform that never delivers
   // one that means nothing reloads, which is a decision the operator made and the
   // broker should say out loud rather than look broken.
-  const silent = startBroker(['-addr', `127.0.0.1:${SIDE_PORT}`, '-reload-interval', '0', '-id', 'signal-only']);
+  //
+  // The reloader logs this from its own goroutine, so there is no guaranteed order
+  // against msg=listening — wait for the line instead of assuming it landed. The
+  // needle is the whole message because log() returns the first hit: a broker whose
+  // -id contains "signal-only" makes the listening line match first, which is how
+  // this check passed on one machine and failed on another.
+  const silent = startBroker(['-addr', `127.0.0.1:${SIDE_PORT}`, '-reload-interval', '0', '-id', 'no-poller']);
   try {
     await waitListening(silent);
+    let notice = '';
+    try {
+      await waitFor('the signal-only notice', () => (notice = silent.log('reloading is signal-only')) !== '');
+    } catch {
+      notice = silent.log('reloading is signal-only');
+    }
     check(
       '-reload-interval 0 says reloading is signal-only',
-      /msg="rule and certificate reloading is signal-only"/.test(silent.log('signal-only')) && /hint="SIGHUP on unix"/.test(silent.log('signal-only')),
-      silent.log('signal-only'),
+      /msg="rule and certificate reloading is signal-only"/.test(notice) && /hint="SIGHUP on unix"/.test(notice),
+      notice || 'no signal-only line',
     );
   } finally {
     await killAndWait(silent);
