@@ -173,7 +173,11 @@ jobs:
             # only forensics, and a few MB is not worth losing them.
             go build -trimpath -o "$name/$cmd$ext" "./cmd/$cmd"
           done
-          cp README.md rules/auth.jsonl rules/acl.jsonl "$name/"
+          # 归档里保持和仓库一样的目录：README 的开发示例写的是
+          # `rules/auth.jsonl`，拍平了拷到二进制旁边，照着 README 敲的人会找不到文件。
+          mkdir -p "$name/rules"
+          cp README.md "$name/"
+          cp rules/auth.jsonl rules/acl.jsonl "$name/rules/"
           (cd "$name" && sha256sum congmq* > SHA256SUMS.txt)
           if [ "$GOOS" = "windows" ]; then
             zip -qr "dist/${name}.zip" "$name"
