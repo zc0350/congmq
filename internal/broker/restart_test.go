@@ -266,8 +266,26 @@ func TestDrainedQueueIsNotStoredAgain(t *testing.T) {
 	if p := ackDelivery(back); string(p.Payload) != "two" {
 		t.Fatalf("second delivery = %q, want two", p.Payload)
 	}
+	// The PUBACK has left this socket, but the broker has not necessarily acted on
+	// it yet, and closing here would race with it: a message the broker still
+	// believes is unacknowledged is redelivered to the next connection, which is
+	// correct QoS 1 behaviour and used to arrive here as "two" instead of "three".
+	// One round trip on this same connection settles it — the read loop answers in
+	// order, so a fence PUBACK that came back means the PUBACK before it landed.
+	back.publishQoS1(100, "cycle/fence", "the ack is in")
 	_ = back.conn.Close()
 
+	// The broker notices a gone connection on its own schedule. Publish before that
+	// and "three" is a live delivery into a socket nobody is reading instead of an
+	// offline queue entry, so the cycle below has nothing to wait for.
+	waitUntil(t, func() bool {
+		s, ok := st.Get("cycle")
+		return ok && !s.Live
+	})
+
+	// Only the offline record can answer the question this test is about: while a
+	// session is live the runtime owns its queue and the record deliberately carries
+	// none of it.
 	if s, ok := st.Get("cycle"); ok && len(s.Queued) != 0 {
 		t.Fatalf("the store kept %d messages that had already been delivered, want none", len(s.Queued))
 	}
