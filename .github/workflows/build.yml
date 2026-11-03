@@ -216,6 +216,10 @@ jobs:
       - name: create or refresh the release
         env:
           GH_TOKEN: ${{ github.token }}
+          # 这个 job 故意不 checkout 源码：它发布的是 cross-compile 的产物，不是工作树。
+          # gh 在没有 .git 的地方要靠 GH_REPO 才知道往哪个仓库发；少了它，
+          # 前面每一步都绿，最后一步只留一句 "failed to run git: not a git repository"。
+          GH_REPO: ${{ github.repository }}
         run: |
           tag="$GITHUB_REF_NAME"
           if gh release view "$tag" >/dev/null 2>&1; then
