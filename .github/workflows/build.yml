@@ -44,7 +44,11 @@ jobs:
           bad=$(gofmt -l .)
           if [ -n "$bad" ]; then echo "::error::gofmt wants these changed: $bad"; exit 1; fi
 
+      # Windows runner 的默认 shell 是 PowerShell，`[ -z ... ]` 直接 ParserError。
+      # 这一步是 bash 写的，就显式点名 bash；两个系统都要真的跑过它，
+      # 否则等于只在 Linux 上验证过发布闸门。
       - name: the release check reads the version from this line
+        shell: bash
         run: |
           v=$(sed -n 's/^const version = "\(.*\)"$/\1/p' cmd/congmq/main.go)
           if [ -z "$v" ]; then echo "::error::no const version found in cmd/congmq/main.go"; exit 1; fi

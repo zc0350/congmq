@@ -8,5 +8,8 @@ test/node_modules/
 /.tmp/
 
 # -store 指向的本地状态目录与追加日志，跑过就有，不该进版本库。
+# state.log 是内部/store/file.go 里写死的文件名，跟着 -store 走到哪写到哪，所以不锚定。
 state.log
-store/
+# 这条必须锚定在根：写成 store/ 会连 internal/store/ 一起吃掉，
+# 第一次 CI 就是这么挂的——本地 go build 全绿，仓库里却没有那个包。
+/store/
