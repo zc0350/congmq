@@ -1,0 +1,12 @@
+# 本地构建产物。CI 会为每个 tag 交叉编译并挂到 Release，仓库里不放二进制。
+bin/
+
+# Node 工具层的依赖只装在 test/ 下（mqtt / mqtt-packet）。
+test/node_modules/
+
+# 手工排障时的临时目录。
+/.tmp/
+
+# -store 指向的本地状态目录与追加日志，跑过就有，不该进版本库。
+state.log
+store/

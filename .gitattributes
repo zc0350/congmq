@@ -1,0 +1,3 @@
+# CI 的 gofmt 检查读的是提交里的 LF。Windows 上 clone 完拿到 CRLF 的 .go，
+# `gofmt -l .` 会把每个文件都列出来——看着像代码没格式化，其实是换行符被转了。
+* text=auto eol=lf

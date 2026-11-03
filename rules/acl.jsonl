@@ -1,0 +1,71 @@
+# cong 插件 ACL 规则。一行一个 JSON 对象；# 开头与空行跳过。
+# 改这个文件不用重启，语义与 auth.jsonl 一样：两半都读成功才一次交换；读坏了整次拒装、
+# 旧策略继续在位（README §5）。收窄规则不会踢掉已经连着的会话，但它的下一次发布与
+# 每一次投递都按新规则判；放宽同理——同一个会话不用重新订阅就继续收得到。
+#   effect : allow | deny，必填
+#   user / clientid : 省略即匹配任意；"match": "regex" 走 POSIX 扩展正则
+#   ip     : 单个 IP 或 CIDR，IPv4/IPv6
+#   cert_cn : 客户端证书的 CommonName，也支持 "cert_cn_match": "regex"（这时 cert_cn 栏放正则）。
+#             它与 user / clientid / ip 一样是同一规则内的 AND 约束，用来把主题范围钉死在证书上。
+#             明文连接、以及"要求但未校验"的证书（只给 -tls-require-client-cert、没给 -tls-ca）
+#             没有身份，永远不命中这类规则，{"cert_cn":"*"} 也不例外；cert_cn_match 必须配 cert_cn，
+#             否则约束会静默消失——所以装载期直接报错。broker 没开 -tls-addr 时整个文件拒绝启动（exit 1），
+#             热加载时同样拒装，保持原来那一代策略。
+#   action : publish = 发布(写入)；subscribe = 订阅过滤器 + 接收消息；all = 两者全部
+#   topics : 字符串按 MQTT 通配符匹配；{"eq": "..."} 与主题做字面比较（把 # 当普通字符串）；
+#            省略 topics 整个字段表示任意主题
+# topics 里的模板记号（展开在插件里做，展开结果再交给 broker 匹配）：
+#   %c = 该连接的 clientid      %u = 该连接的 username
+#   %1..%9 = "user" 正则的第 1..9 个捕获组，%0 = 正则的整体匹配
+#   %% = 一个真正的百分号；不是上述记号的 %x 原样保留
+#   因为一次替换只能填一段，"产品ID/设备ID" 这种跨层的主题只能用 %1 这类捕获组，
+#   不能指望 broker 自带的 %c（broker 只会把身份填进一个层级）。
+#   装载期就会检查：%1 要求 "user" 是 "match": "regex" 且分组数足够，否则整个文件拒绝加载。
+#   运行期：展开出来的身份里如果带 + 或 #，这条规则直接不命中并记日志——否则一个
+#   clientid 为 "a/#" 的客户端会把自己那条规则放大成任意主题。
+# 求值顺序：严格按文件顺序，第一条同时满足 subject + action + topic 的规则决定 allow 或 deny。
+# 没有任何规则命中时一律拒绝（本实现的 no_match = deny）。
+# 与 mosquitto 原生 acl 文件不同：原生的 deny 会被悄悄提到同一用户 allow 之前，这里不重排。
+
+# 允许用户名 dashboard 订阅 "$SYS/#"
+{"effect":"allow","user":"dashboard","action":"subscribe","topics":["$SYS/#"]}
+
+# 允许来自 127.0.0.1 的客户端发布和订阅 "$SYS/#" 以及 "#"
+{"effect":"allow","ip":"127.0.0.1","action":"all","topics":["$SYS/#","#"]}
+
+# 拒绝其他用户订阅 "$SYS/#"、"#" 和 "+/#"
+{"effect":"deny","action":"subscribe","topics":["$SYS/#",{"eq":"#"},{"eq":"+/#"}]}
+
+# ---- 产品 abcde 的设备通道 ----
+# 设备名两种写法都放行，主题始终是 产品ID/设备ID/event：
+#   用户名 abcde_aaaa -> 捕获组 %1 = aaaa -> abcde/aaaa/event
+{"effect":"allow","user":"^abcde_([a-z0-9]+)$","match":"regex","action":"publish","topics":["abcde/%1/event"]}
+#   用户名 aaaa_abcde -> 捕获组 %1 = aaaa -> abcde/aaaa/event（产品名写成字面量）
+{"effect":"allow","user":"^([a-z0-9]+)_abcde$","match":"regex","action":"publish","topics":["abcde/%1/event"]}
+# 设备自己的下行命令通道，同一个 %1 再订阅一次
+{"effect":"allow","user":"^abcde_([a-z0-9]+)$","match":"regex","action":"subscribe","topics":["abcde/%1/cmd"]}
+{"effect":"allow","user":"^([a-z0-9]+)_abcde$","match":"regex","action":"subscribe","topics":["abcde/%1/cmd"]}
+# 说明：这里的下划线是正则里的普通字符，ACL 匹配用的是原始 username，不做清洗；
+# "sanitize" 只影响 auth.jsonl 里参与摘要的用户名。设备 ID 若含连字符，把字符类
+# 写成 ([a-z0-9_-]+) 即可（只有 + 和 # 不能出现在展开结果里）。
+
+# 前面的规则都没命中时，允许所有操作
+# 注意：生产环境应把这条改成 {"effect":"deny"}，并显式列出设备允许的通道
+{"effect":"allow"}
+
+# ---- 可选写法示例（去掉注释即可生效，注意放在兜底规则之前）----
+# 设备只能发布自己那一层，%c 会被替换成该连接的 clientid
+#{"effect":"allow","user":"^aaaa_.*","match":"regex","action":"publish","topics":["sensor/%c/data"]}
+# 设备只能订阅自己的下行命令通道
+#{"effect":"allow","user":"^aaaa_.*","match":"regex","action":"subscribe","topics":["command/%c/+"]}
+# 按用户名划分命名空间，%u 是 username 原文（含下划线）
+#{"effect":"allow","action":"all","topics":["tenants/%u/#"]}
+# 主题里真的要一个百分号：%%（"sales/50%%off" 匹配 sales/50%off）
+#{"effect":"allow","action":"publish","topics":["sales/50%%off"]}
+# 这块证书只能碰 plant/#（mTLS：凭据是证书，主题范围由证书决定）
+#{"effect":"allow","action":"all","cert_cn":"congmq-device-1","topics":["plant/#"]}
+# 同一型号一批设备：CN 走正则
+#{"effect":"allow","action":"all","cert_cn_match":"regex","cert_cn":"^plant-[0-9]+$","topics":["plant/#"]}
+# 先拒后放：deny 写在前面才有意义（严格按文件顺序，不重排）
+#{"effect":"deny","action":"publish","cert_cn_match":"regex","cert_cn":"^bot-","topics":["cmd/#"]}
+#{"effect":"allow","action":"all","cert_cn_match":"regex","cert_cn":"^bot-","topics":["plant/#","cmd/#"]}

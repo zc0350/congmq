@@ -1,0 +1,225 @@
+name: build
+
+# Three shapes on purpose:
+#   push / pull_request -> prove the tree builds and that it speaks real MQTT
+#   tag v*              -> the same proofs, then cross-compile and publish a Release
+# `-race` is deliberately absent: it needs cgo, and this kernel is pure Go
+# (CGO_ENABLED=0 in every build below), so CI must not start demanding a toolchain
+# the released binaries never used. `cache: false` for the same reason — the module
+# has no dependencies, so there is nothing worth caching.
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  go:
+    name: go test / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: gofmt
+        if: runner.os == 'Linux'
+        run: |
+          bad=$(gofmt -l .)
+          if [ -n "$bad" ]; then echo "::error::gofmt wants these changed: $bad"; exit 1; fi
+
+      - name: the release check reads the version from this line
+        run: |
+          v=$(sed -n 's/^const version = "\(.*\)"$/\1/p' cmd/congmq/main.go)
+          if [ -z "$v" ]; then echo "::error::no const version found in cmd/congmq/main.go"; exit 1; fi
+          echo "compiled-in version: $v"
+
+      - run: go vet ./...
+      - run: go test -count=1 ./...
+
+  conformance:
+    name: third-party client / ubuntu
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: build the three binaries
+        run: |
+          go build -trimpath -o bin/congmq ./cmd/congmq
+          go build -trimpath -o bin/congmq-cert ./cmd/congmq-cert
+          go build -trimpath -o bin/congmq-load ./cmd/congmq-load
+
+      - name: install the harness (mqtt.js only)
+        working-directory: test
+        run: npm ci --no-audit --no-fund
+
+      # The first three scripts talk to a broker somebody else started, each with
+      # different flags, so each gets its own broker and it dies with the step.
+      - name: conformance.mjs (3.1.1, no rules)
+        run: |
+          ./bin/congmq -addr 127.0.0.1:1883 -log-level warn &
+          broker=$!
+          trap 'kill $broker 2>/dev/null' EXIT
+          sleep 1
+          (cd test && MQTT_URL=mqtt://127.0.0.1:1883 node conformance.mjs)
+
+      - name: v5-check.mjs (5.0 capabilities)
+        run: |
+          ./bin/congmq -addr 127.0.0.1:1887 -topic-alias-max 4 -max-packet-size 512 \
+            -receive-max 100 -metrics 127.0.0.1:1888 -log-level warn &
+          broker=$!
+          trap 'kill $broker 2>/dev/null' EXIT
+          sleep 1
+          (cd test && MQTT_URL=mqtt://127.0.0.1:1887 METRICS_URL=http://127.0.0.1:1888/metrics node v5-check.mjs)
+
+      - name: rules-check.mjs (auth.jsonl / acl.jsonl)
+        run: |
+          ./bin/congmq -addr :1883 -auth rules/auth.jsonl -acl rules/acl.jsonl -log-level warn &
+          broker=$!
+          trap 'kill $broker 2>/dev/null' EXIT
+          sleep 1
+          (cd test && CONGMQ_PORT=1883 node rules-check.mjs)
+
+      # These three start and kill their own brokers; they only need the binaries.
+      - name: tls-check.mjs (TLS / mTLS)
+        run: (cd test && node tls-check.mjs)
+
+      - name: reload-check.mjs (no-downtime operations)
+        run: (cd test && node reload-check.mjs)
+
+      - name: crash-check.mjs (kill -9 and recover)
+        run: (cd test && node crash-check.mjs)
+
+  cross-compile:
+    name: ${{ matrix.goos }}/${{ matrix.goarch }}${{ matrix.goarm }}
+    needs: [go, conformance]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {goos: linux, goarch: amd64}
+          - {goos: linux, goarch: arm64}
+          - {goos: linux, goarch: arm, goarm: "7"}
+          - {goos: windows, goarch: amd64}
+          - {goos: darwin, goarch: amd64}
+          - {goos: darwin, goarch: arm64}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: the tag must equal the compiled-in version
+        run: |
+          want=${GITHUB_REF_NAME#v}
+          got=$(sed -n 's/^const version = "\(.*\)"$/\1/p' cmd/congmq/main.go)
+          if [ "$want" != "$got" ]; then
+            echo "::error::tag is v$want but cmd/congmq/main.go says $got — bump the constant or retag"
+            exit 1
+          fi
+          echo "v$want == const version $got"
+
+      - name: build and package
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          GOARM: ${{ matrix.goarm }}
+          CGO_ENABLED: "0"
+        run: |
+          set -euo pipefail
+          ext=""
+          [ "$GOOS" = "windows" ] && ext=".exe"
+          arch="$GOARCH"
+          [ -n "${GOARM:-}" ] && arch="armv$GOARM"
+          name="congmq-${GITHUB_REF_NAME}-${GOOS}-${arch}"
+          mkdir -p "$name" dist
+          for cmd in congmq congmq-load congmq-cert; do
+            # No -s -w: a broker's panic trace and goroutine dump are the operator's
+            # only forensics, and a few MB is not worth losing them.
+            go build -trimpath -o "$name/$cmd$ext" "./cmd/$cmd"
+          done
+          cp README.md rules/auth.jsonl rules/acl.jsonl "$name/"
+          (cd "$name" && sha256sum congmq* > SHA256SUMS.txt)
+          if [ "$GOOS" = "windows" ]; then
+            zip -qr "dist/${name}.zip" "$name"
+          else
+            tar czf "dist/${name}.tar.gz" "$name"
+          fi
+          rm -rf "$name"
+          (cd dist && sha256sum congmq-* > SHA256SUMS.txt)
+          ls -la dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binaries-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.goarm }}
+          path: dist
+          if-no-files-found: error
+
+  release:
+    name: publish release
+    needs: cross-compile
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: binaries-*
+          merge-multiple: true
+          path: dist
+
+      - name: one checksum file for the whole release
+        run: |
+          cd dist
+          rm -f SHA256SUMS.txt
+          sha256sum congmq-* > SHA256SUMS.txt
+          ls -la
+          cat SHA256SUMS.txt
+
+      - name: create or refresh the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="$GITHUB_REF_NAME"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" dist/* --clobber
+          else
+            gh release create "$tag" dist/* \
+              --title "congmq $tag" \
+              --latest \
+              --notes "手写内核的 MQTT 3.1.1 + 5.0 broker，零第三方运行时依赖。每个归档含 congmq / congmq-load / congmq-cert、示例规则文件与 SHA256SUMS.txt；能力、边界与实测容量基线见 README。"
+          fi
+          gh release view "$tag" --json tagName,assets --jq '.tagName + " -> " + ([.assets[].name] | join(", "))'

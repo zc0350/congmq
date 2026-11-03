@@ -1,0 +1,41 @@
+# cong 插件登录规则。一行一个 JSON 对象；# 开头与空行跳过。
+# 改这个文件不用重启：broker 每 -reload-interval（默认 2s）重查一次指纹，unix 上 SIGHUP 立刻查一次。
+#   写坏了什么都不改——旧策略继续在位，只把 rules_reload_failures 加一（README §5）。
+# 未知字段会让插件拒绝加载整个文件（拼错字段不能悄悄削弱规则）。
+#   username / clientid : 省略即匹配任意；"match": "regex" 走 POSIX 扩展正则；"*" 表示任意
+#   ip                  : 单个 IP 或 CIDR，IPv4/IPv6
+#   alg                 : md5 | sha1 | sha256 | sha512
+#   scheme              : username+salt | salt+username | salt+username+salt
+#   sanitize            : 默认 true，摘要使用的用户名会删掉非 [A-Za-z0-9] 字符（下划线、逗号、竖线等）
+#   cert_cn             : 客户端证书的 CommonName；写正则时把 "cert_cn_match": "regex" 一起加上
+#                         - 只有 cert_cn、没有 alg/scheme 的规则：证书本身就是凭据（TLS 握手已经证明
+#                           对端持有私钥，没有第二个秘密可查）
+#                         - cert_cn + alg/scheme：两个都要中，用途是把一个密码钉死在特定证书上
+#                         - cert_cn 规则不许带 salt（它不检查密码）；cert_cn_match 必须配 cert_cn
+#                         - broker 没开 -tls-addr 时，含 cert_cn 的文件直接拒绝启动（exit 1）；
+#                           热加载时同样拒装，保持原来那一代策略
+#                         - 明文连接、以及"要求但未校验"的证书（只给 -tls-require-client-cert、
+#                           没给 -tls-ca）都没有身份，永远不命中 cert_cn 规则，{"cert_cn":"*"} 也不例外
+# 命中顺序：字面 username 的规则优先，其次按文件顺序尝试正则/"*" 规则；
+# 同一条规则的 clientid 与 ip 是附加约束（AND）。全部试完仍不匹配即拒绝。
+
+# dashboard：sha256(salt + "dashboard")
+{"username":"dashboard","salt":"c0ng-2026","alg":"sha256","scheme":"salt+username"}
+
+# aaaa_bbbb / aaaa_cccc 这类账号统一用一条正则规则；正则作用于原始用户名，
+# 摘要作用于去掉下划线之后的用户名：md5("aaaabbbb" + "d3v1c3")
+{"username":"^aaaa_[a-z0-9]+$","match":"regex","salt":"d3v1c3","alg":"md5","scheme":"username+salt"}
+
+# 网关账号：用户名正则 + clientid 正则 + 来源网段三个条件同时满足
+{"username":"^gw_.*","match":"regex","clientid":"^gw-[0-9A-F]{8}$","clientid_match":"regex","ip":"10.0.0.0/8","salt":"gtw","alg":"sha512","scheme":"salt+username+salt"}
+
+# 显式关闭清洗的例子：摘要里保留 username 原文（含下划线）
+{"username":"legacy_x","salt":"old","alg":"sha1","scheme":"username+salt","sanitize":false}
+
+# ---- 可选写法示例（需要 broker 带 -tls-addr -tls-ca 启动；去掉注释即可生效）----
+# 一机一密：证书 CN 就是凭据，设备不用在报文里带任何密码
+#{"cert_cn":"congmq-device-1"}
+# 一整批同型号设备
+#{"cert_cn_match":"regex","cert_cn":"^plant-[0-9]+$"}
+# 密码仍然要，但只有配上这块证书才算数（换了证书，密码对也进不来）
+#{"cert_cn":"congmq-device-1","username":"meter","salt":"s","alg":"sha256","scheme":"salt+username"}

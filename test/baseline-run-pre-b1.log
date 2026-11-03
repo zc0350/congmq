@@ -1,0 +1,121 @@
+broker   C:\work\program\mqtt\congmq\bin\congmq.exe
+loader   C:\work\program\mqtt\congmq\bin\congmq-load.exe
+ports    mqtt 127.0.0.1:1901  metrics http://127.0.0.1:1902/metrics  tls 127.0.0.1:1903
+seconds  10 per row
+groups   conns, pump, payload, fanout, fsync, tls (19 rows)
+
+[1/19] 1,000 空闲长连接
+    ramp: 1000/1000 connections up in 94ms (10659/s), 0 refused, 0 subscribe errors
+    first: online=1000 goroutines=3010 gc=6 mem_sys=69 MiB heap=27 MiB -> 66289 B/conn reserved, 28809 B/conn live
+    settled: online=1000 goroutines=3010 gc=6 mem_sys=69 MiB heap=27 MiB -> 66289 B/conn reserved, 28837 B/conn live
+[2/19] 5,000 空闲长连接
+    ramp: 5000/5000 connections up in 453ms (11041/s), 0 refused, 0 subscribe errors
+    first: online=5000 goroutines=15010 gc=10 mem_sys=311 MiB heap=135 MiB -> 63070 B/conn reserved, 28285 B/conn live
+    settled: online=5000 goroutines=15010 gc=10 mem_sys=311 MiB heap=135 MiB -> 63070 B/conn reserved, 28289 B/conn live
+[3/19] 10,000 空闲长连接
+    ramp: 10000/10000 connections up in 999ms (10006/s), 0 refused, 0 subscribe errors
+    first: online=10000 goroutines=30010 gc=11 mem_sys=622 MiB heap=267 MiB -> 64111 B/conn reserved, 27977 B/conn live
+    settled: online=10000 goroutines=30010 gc=11 mem_sys=622 MiB heap=267 MiB -> 64111 B/conn reserved, 27979 B/conn live
+[4/19] QoS 0 · 8 发 8 收 · 256 B（压到饱和）
+    8 publishers, 8 subscribers, 0 away sessions, qos 0, 256 B payload
+    230487 msg/s in (508.9 Mbit/s), 2305567 delivered, 2305567 timed, mean=41.118ms p10=17.239 p50=41.504 p90=63.299 p99=81.509 max=113.1ms (clock granularity 0.31ms)
+[5/19] QoS 1 · 8 发 8 收 · 256 B（压到饱和）
+    8 publishers, 8 subscribers, 0 away sessions, qos 1, 256 B payload
+    107646 msg/s in (237.7 Mbit/s), 1072054 delivered, 1072054 timed, mean=26.263ms p10=8.672 p50=22.165 p90=51.498 p99=73.043 max=101.2ms (clock granularity 0.50ms)
+[6/19] QoS 2 · 8 发 8 收 · 256 B（压到饱和）
+    8 publishers, 8 subscribers, 0 away sessions, qos 2, 256 B payload
+    54886 msg/s in (121.2 Mbit/s), 548747 delivered, 548747 timed, mean=39.882ms p10=13.459 p50=30.898 p90=81.181 p99=128.343 max=171.6ms (clock granularity 0.50ms)
+[7/19] QoS 1 · 8 发 8 收 · 256 B · 限速 5k/s（现实速率的延迟）
+    8 publishers, 8 subscribers, 0 away sessions, qos 1, 256 B payload
+    5000 msg/s in (11.0 Mbit/s), 50005 delivered, 50005 timed, mean=0.061ms p10=0.000 p50=0.000 p90=0.000 p99=0.768 max=8.7ms (clock granularity 0.31ms)
+[8/19] 3.1.1 QoS 1 · 8 发 8 收 · 256 B（压到饱和）
+    8 publishers, 8 subscribers, 0 away sessions, qos 1, 256 B payload
+    96123 msg/s in (212.2 Mbit/s), 934261 delivered, 934261 timed, mean=47.481ms p10=13.902 p50=46.382 p90=83.861 p99=103.373 max=154.6ms (clock granularity 0.35ms)
+[9/19] 载荷 64 B · QoS 1
+    8 publishers, 8 subscribers, 0 away sessions, qos 1, 64 B payload
+    92693 msg/s in (62.3 Mbit/s), 913256 delivered, 913256 timed, mean=43.514ms p10=12.335 p50=40.517 p90=78.379 p99=103.662 max=176.3ms (clock granularity 0.30ms)
+[10/19] 载荷 256 B · QoS 1
+    8 publishers, 8 subscribers, 0 away sessions, qos 1, 256 B payload
+    107899 msg/s in (238.2 Mbit/s), 1077725 delivered, 1077725 timed, mean=25.064ms p10=8.321 p50=20.896 p90=48.792 p99=72.638 max=94.1ms (clock granularity 0.50ms)
+[11/19] 载荷 1024 B · QoS 1
+    8 publishers, 8 subscribers, 0 away sessions, qos 1, 1024 B payload
+    93291 msg/s in (779.2 Mbit/s), 914886 delivered, 914886 timed, mean=41.614ms p10=10.838 p50=37.478 p90=79.127 p99=99.092 max=124.8ms (clock granularity 0.33ms)
+[12/19] 载荷 4096 B · QoS 1
+    8 publishers, 8 subscribers, 0 away sessions, qos 1, 4096 B payload
+    84268 msg/s in (2774.8 Mbit/s), 767024 delivered, 767024 timed, mean=66.576ms p10=17.439 p50=70.168 p90=110.300 p99=139.303 max=179.3ms (clock granularity 0.33ms)
+[13/19] 1 发 8 收 · 同一主题（扇出 ×8）
+    1 publishers, 8 subscribers, 0 away sessions, qos 1, 256 B payload
+    22347 msg/s in (49.3 Mbit/s), 1788008 delivered, 1788008 timed, mean=5.802ms p10=3.472 p50=5.488 p90=8.482 p99=12.838 max=24.7ms (clock granularity 0.51ms)
+[14/19] 8 发 0 收 · QoS 1（纯入站）
+    8 publishers, 0 subscribers, 0 away sessions, qos 1, 256 B payload
+    199143 msg/s in (439.7 Mbit/s), 0 delivered, 0 timed, mean=0.000ms p10=0.000 p50=0.000 p90=0.000 p99=0.000 max=0.0ms (clock granularity 0.50ms)
+[15/19] -store-sync everysec · 8 离线会话排队
+    4 publishers, 2 subscribers, 8 away sessions, qos 1, 128 B payload
+    2825 msg/s in (3.3 Mbit/s), 13568 delivered, 13568 timed, mean=119.649ms p10=0.519 p50=146.091 p90=164.711 p99=183.254 max=197.5ms (clock granularity 0.51ms)
+[16/19] -store-sync always · 8 离线会话排队
+    4 publishers, 2 subscribers, 8 away sessions, qos 1, 128 B payload
+    227 msg/s in (0.3 Mbit/s), 1006 delivered, 1006 timed, mean=1887.563ms p10=791.248 p50=2082.874 p90=2424.148 p99=2448.958 max=2456.7ms (clock granularity 0.50ms)
+[17/19] -store-sync never · 8 离线会话排队
+    4 publishers, 2 subscribers, 8 away sessions, qos 1, 128 B payload
+    2862 msg/s in (3.4 Mbit/s), 13820 delivered, 13820 timed, mean=117.091ms p10=0.558 p50=144.532 p90=161.263 p99=174.041 max=182.7ms (clock granularity 0.34ms)
+[18/19] QoS 1 · 8 发 8 收 · 256 B · 明文
+    8 publishers, 8 subscribers, 0 away sessions, qos 1, 256 B payload
+    98474 msg/s in (217.4 Mbit/s), 980224 delivered, 980224 timed, mean=30.475ms p10=8.849 p50=25.349 p90=61.154 p99=82.488 max=112.4ms (clock granularity 0.30ms)
+[19/19] QoS 1 · 8 发 8 收 · 256 B · TLS（服务端证书）
+    8 publishers, 8 subscribers, 0 away sessions, qos 1, 256 B payload
+    96715 msg/s in (213.5 Mbit/s), 958499 delivered, 958499 timed, mean=32.771ms p10=9.582 p50=26.731 p90=66.829 p99=91.400 max=121.7ms (clock granularity 0.50ms)
+
+### 连接成本（idle connection cost）
+
+| 连接数 | 建立 conn/s | 失败 | goroutines | mem_sys (MiB) | 每连接预留 | 每连接活跃 | 活跃/连接（刚建完） |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 1,000 | 10,659 | 0 | 3,010 | 70.0 | 64.7 KiB | 28.2 KiB | 28.1 KiB |
+| 5,000 | 11,041 | 0 | 15,010 | 311.5 | 61.6 KiB | 27.6 KiB | 27.6 KiB |
+| 10,000 | 10,006 | 0 | 30,010 | 622.2 | 62.6 KiB | 27.3 KiB | 27.3 KiB |
+
+### QoS 吞吐
+
+| 场景 | msg/s | ≈Mbit/s（载荷+20B） | 已投递 | p50 | p90 | p99 | goroutines | mem_sys (MiB) | dropped | spills |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| QoS 0 · 8 发 8 收 · 256 B（压到饱和） | 230,487 | 508.9 | 2,305,567 | 41.50 ms | 63.30 ms | 81.51 ms | 58 | 25.0 | 0 | 0 |
+| QoS 1 · 8 发 8 收 · 256 B（压到饱和） | 107,646 | 237.7 | 1,072,054 | 22.17 ms | 51.50 ms | 73.04 ms | 58 | 25.5 | 4,627 | 0 |
+| QoS 2 · 8 发 8 收 · 256 B（压到饱和） | 54,886 | 121.2 | 548,747 | 30.90 ms | 81.18 ms | 128.34 ms | 58 | 25.5 | 150 | 0 |
+| QoS 1 · 8 发 8 收 · 256 B · 限速 5k/s（现实速率的延迟） | 5,000 | 11.0 | 50,005 | ≤0.31 ms† | ≤0.31 ms† | 768 µs | 58 | 17.0 | 0 | 0 |
+| 3.1.1 QoS 1 · 8 发 8 收 · 256 B（压到饱和） | 96,123 | 212.2 | 934,261 | 46.38 ms | 83.86 ms | 103.37 ms | 58 | 29.5 | 27,059 | 0 |
+
+### 载荷大小
+
+| 场景 | msg/s | ≈Mbit/s（载荷+20B） | 已投递 | p50 | p90 | p99 | goroutines | mem_sys (MiB) | dropped | spills |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 载荷 64 B · QoS 1 | 92,693 | 62.3 | 913,256 | 40.52 ms | 78.38 ms | 103.66 ms | 58 | 25.7 | 13,806 | 0 |
+| 载荷 256 B · QoS 1 | 107,899 | 238.2 | 1,077,725 | 20.90 ms | 48.79 ms | 72.64 ms | 58 | 25.2 | 1,506 | 0 |
+| 载荷 1024 B · QoS 1 | 93,291 | 779.2 | 914,886 | 37.48 ms | 79.13 ms | 99.09 ms | 58 | 37.8 | 18,241 | 0 |
+| 载荷 4096 B · QoS 1 | 84,268 | 2774.8 | 767,024 | 70.17 ms | 110.30 ms | 139.30 ms | 58 | 110.8 | 75,940 | 0 |
+
+### 扇入扇出
+
+| 场景 | msg/s | ≈Mbit/s（载荷+20B） | 已投递 | p50 | p90 | p99 | goroutines | mem_sys (MiB) | dropped | spills |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 发 8 收 · 同一主题（扇出 ×8） | 22,347 | 49.3 | 1,788,008 | 5.49 ms | 8.48 ms | 12.84 ms | 37 | 21.6 | 0 | 0 |
+| 8 发 0 收 · QoS 1（纯入站） | 199,143 | 439.7 | 0 | — | — | — | 34 | 17.2 | 0 | 0 |
+
+### 三档 fsync 的代价（离线队列落盘）
+
+| sync 模式 | msg/s（实发） | 已投递 | p50 | p99 | state.log | 每条落盘 | spills | dropped | 丢失窗口 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| everysec | 2,825 | 13,568 | 146.09 ms | 183.25 ms | 28001.1 KiB | 1015 B/条 | 48,508 | 48,508 | ≤1 s |
+| always | 227 | 1,006 | 2082.87 ms | 2448.96 ms | 2482.9 KiB | 1116 B/条 | 0 | 0 | 0（每条落盘） |
+| never | 2,862 | 13,820 | 144.53 ms | 174.04 ms | 28064.1 KiB | 1004 B/条 | 49,244 | 49,244 | 整个进程 |
+
+### TLS 的代价（同一配置，只差一层加密）
+
+| 场景 | msg/s | ≈Mbit/s（载荷+20B） | 已投递 | p50 | p90 | p99 | goroutines | mem_sys (MiB) | dropped | spills |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| QoS 1 · 8 发 8 收 · 256 B · 明文 | 98,474 | 217.4 | 980,224 | 25.35 ms | 61.15 ms | 82.49 ms | 58 | 29.5 | 4,755 | 0 |
+| QoS 1 · 8 发 8 收 · 256 B · TLS（服务端证书） | 96,715 | 213.5 | 958,499 | 26.73 ms | 66.83 ms | 91.40 ms | 59 | 25.7 | 8,838 | 0 |
+
+### 仪表自检
+
+压测端的 `delivered` 对 broker 的 `messages_out`：16/16 行相等。两个计数器从套接口的两侧数同一批投递，相等才说明上面的表值得引用。
+
+written   test\baseline-2026-11-03.md

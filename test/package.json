@@ -1,0 +1,19 @@
+{
+  "name": "congmq-tools",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Third-party client conformance harness for the congmq broker: proves the hand-written wire format speaks real MQTT.",
+  "scripts": {
+    "conformance": "node conformance.mjs",
+    "v5-check": "node v5-check.mjs",
+    "rules-check": "node rules-check.mjs",
+    "tls-check": "node tls-check.mjs",
+    "reload-check": "node reload-check.mjs",
+    "crash-check": "node crash-check.mjs",
+    "load-baseline": "node load-baseline.mjs"
+  },
+  "dependencies": {
+    "mqtt": "^5.16.1"
+  }
+}
