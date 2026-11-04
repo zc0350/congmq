@@ -327,11 +327,63 @@ func TestV5SessionExpiryKeepsStateThenTheReaperEndsIt(t *testing.T) {
 		_, ok := st.Get("away")
 		return !ok
 	})
-	if m := b.Metrics(); m.ExpiredSessions == 0 {
+	m := b.Metrics()
+	if m.ExpiredSessions == 0 {
 		t.Error("expired sessions were not counted")
 	}
-	if n := b.Metrics().Subscriptions; n != 0 {
+	if n := m.Subscriptions; n != 0 {
 		t.Errorf("subscriptions = %d, want the expired session's filter withdrawn", n)
+	}
+	// The store is the last place a reaped session can still be hiding, so this
+	// is where its gauges have to say zero - a queue the broker forgot to give
+	// back would show up here and nowhere else.
+	if m.StoreSessions != 0 || m.StoreQueued != 0 {
+		t.Errorf("store holds %d sessions / %d queued after the reaper ran, want none",
+			m.StoreSessions, m.StoreQueued)
+	}
+}
+
+// TestSpilledMessagesCountAsQueueingNotOnlyAsOverflow pins what queue_spills
+// means: every message the router handed to an offline session, not only the
+// ones that overflowed a bounded queue. A fleet that is being fed from the store
+// has to show up in that counter, because the counter is the only sign an
+// operator has that subscriptions are being served to clients who are not
+// connected - a healthy broker would otherwise report nothing at all.
+func TestSpilledMessagesCountAsQueueingNotOnlyAsOverflow(t *testing.T) {
+	st := store.NewMemoryStore()
+	b := startBroker(t, st, func(o *broker.Options) { o.QueueMax = 4 })
+
+	sub := dialV5(t, b)
+	sub.mustV5("away", false, 3600)
+	sub.v5sub(1, nil, flt("hold/1", packets.QoS1))
+	_ = sub.conn.Close()
+	waitUntil(t, func() bool {
+		s, ok := st.Get("away")
+		return ok && len(s.Subscriptions) == 1
+	})
+
+	pub := dialV5(t, b)
+	pub.mustV5("pub", true, 0)
+	for i := 0; i < 6; i++ {
+		if code := pub.v5publish("hold/1", strings.Repeat("x", i+1), packets.QoS1, uint16(i+1), nil); code != packets.RSuccess {
+			t.Fatalf("PUBACK code = %#02x, want success", code)
+		}
+	}
+	// The publisher's own record is a live session, and the store counts those
+	// too; closing it leaves the queueing subscriber as the only resident.
+	_ = pub.conn.Close()
+	waitUntil(t, func() bool { return b.Metrics().Online == 0 })
+
+	m := b.Metrics()
+	if m.QueueSpills != 6 {
+		t.Errorf("queue_spills = %d, want one per message queued", m.QueueSpills)
+	}
+	if m.Dropped != 2 {
+		t.Errorf("dropped_messages = %d, want the two oldest pushed out of a 4-deep queue", m.Dropped)
+	}
+	if m.StoreSessions != 1 || m.StoreQueued != 4 {
+		t.Errorf("store holds %d sessions / %d queued, want 1 session holding the newest 4",
+			m.StoreSessions, m.StoreQueued)
 	}
 }
 
@@ -360,8 +412,13 @@ func TestV5SessionExpiryIsClampedByTheOperator(t *testing.T) {
 		o.ReapInterval = 50 * time.Millisecond
 	})
 	c := dialV5(t, b)
-	c.mustV5("clamped", false, 3600) // asks for an hour
+	ack := c.mustV5("clamped", false, 3600) // asks for an hour
 	c.v5sub(1, nil, flt("c/1", packets.QoS1))
+	// The override has to be in the CONNACK: a client that believes it has an hour
+	// keeps queueing for a session that was reaped a second after it hung up.
+	if !ack.Props.Has(packets.PropSessionExpiry) || ack.Props.SessionExpiry != 1 {
+		t.Errorf("CONNACK Session Expiry = %v, want it to say the 1s that is really in force", ack.Props)
+	}
 	_ = c.conn.Close()
 
 	waitUntil(t, func() bool {
@@ -369,6 +426,25 @@ func TestV5SessionExpiryIsClampedByTheOperator(t *testing.T) {
 		return ok && !s.Expiry.IsZero() && time.Until(s.Expiry) < 5*time.Second
 	})
 	waitUntil(t, func() bool { _, ok := st.Get("clamped"); return !ok })
+}
+
+func TestV5SessionExpiryMaximumCapsAForeverRequest(t *testing.T) {
+	st := store.NewMemoryStore()
+	b := startBroker(t, st, func(o *broker.Options) {
+		o.SessionExpiryMax = 2 * time.Second
+		o.ReapInterval = 50 * time.Millisecond
+	})
+	c := dialV5(t, b)
+	ack := c.mustV5("forever", false, 0xFFFFFFFF)
+	if ack.Props.Has(packets.PropSessionExpiry) && ack.Props.SessionExpiry != 2 {
+		t.Errorf("CONNACK Session Expiry = %d, want the operator's 2s", ack.Props.SessionExpiry)
+	}
+	_ = c.conn.Close()
+
+	// The session has to actually die: 0xFFFFFFFF used to be the one request that
+	// sailed straight through a -session-expiry-max, which is the flag an operator
+	// sets precisely so that no session can hold disk forever.
+	waitUntil(t, func() bool { _, ok := st.Get("forever"); return !ok })
 }
 
 func TestV5CleanStartDiscardsTheStoredSession(t *testing.T) {

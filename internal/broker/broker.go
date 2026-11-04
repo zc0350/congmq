@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/netip"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -47,6 +48,11 @@ type Options struct {
 	MailboxSize int
 	// MaxConns caps open connections; 0 means unlimited.
 	MaxConns int
+	// MaxSubs caps how many distinct topic filters one client may hold at the same
+	// time; 0 means unlimited. This one is per session rather than per address: it
+	// bounds the fan-out a single device can make the router maintain for it, and
+	// a subscription costs far more than a socket.
+	MaxSubs int
 	// RetryInterval is how often unacknowledged outbound messages are resent.
 	RetryInterval time.Duration
 	// WriteTimeout bounds a single frame write before the peer is considered
@@ -91,6 +97,55 @@ type Options struct {
 	// TCP part would otherwise hold a goroutine and a socket for as long as it
 	// liked, which is the cheapest denial of service there is.
 	HandshakeTimeout time.Duration
+
+	// --- per-address abuse resistance ---
+	//
+	// Every knob here defaults to off, because the broker cannot tell a NAT'd
+	// factory floor from an attack: both look like one address asking for many
+	// connections. An operator who knows which of the two they are running turns
+	// these on.
+
+	// MaxConnsPerIP caps how many connections one source address may hold at the
+	// same time; 0 means unlimited. It counts sockets, not sessions, so a peer
+	// that connects and stays silent is metered — see gate.acquire.
+	MaxConnsPerIP int
+	// ConnectRatePerIP is how many new connections a source address may start per
+	// second, on a token bucket; 0 means unmetered. Sub-second rates are
+	// expressible (0.2 is one connection every five seconds).
+	ConnectRatePerIP float64
+	// ConnectBurstPerIP is how many connections a quiet address may spend at once.
+	// 0 means one second's worth — the rate itself, never less than one.
+	ConnectBurstPerIP float64
+
+	// AuthFailLimit is how many CONNECTs from one source address the auth rules
+	// may refuse inside AuthFailWindow before the address is locked out; 0 turns
+	// the whole thing off. While an address is locked out its CONNECTs are refused
+	// with the same code a wrong password gets, so a correct password is refused
+	// too — which is why this is opt-in, and why a factory floor behind one address
+	// should not have it armed.
+	AuthFailLimit int
+	// AuthFailWindow is how long AuthFailLimit counts for.
+	AuthFailWindow time.Duration
+	// AuthLockout is how long a locked address stays refused. 0 means one window:
+	// the address has to be quiet for as long as the window it blew.
+	AuthLockout time.Duration
+
+	// --- real client addresses behind a load balancer ---
+
+	// Proxy says how a PROXY protocol transport header in front of the first
+	// payload byte is treated. Off, no header is read and a socket's peer is the
+	// whole story — which behind a load balancer means every device in the fleet
+	// arrives wearing the balancer's address, and every address-keyed decision
+	// above is then made about the wrong machine.
+	Proxy ProxyMode
+	// TrustedProxies are the addresses allowed to report someone else's. Only
+	// consulted in ProxyTrusted mode; in ProxyRequire every peer is expected to send
+	// a header and the list would do nothing, so cmd/congmq refuses the combination.
+	TrustedProxies []netip.Prefix
+	// ProxyHeaderTimeout bounds the read of the header itself. A peer that opens
+	// the socket and says nothing would otherwise hold the parsing goroutine for
+	// as long as it liked.
+	ProxyHeaderTimeout time.Duration
 }
 
 func (o *Options) withDefaults() {
@@ -130,9 +185,24 @@ func (o *Options) withDefaults() {
 	if o.HandshakeTimeout <= 0 {
 		o.HandshakeTimeout = 10 * time.Second
 	}
+	// Only a broker that reads a transport header needs a deadline for reading it,
+	// but the default lives here so the number has one home.
+	if o.ProxyHeaderTimeout <= 0 {
+		o.ProxyHeaderTimeout = 5 * time.Second
+	}
 	if o.Logger == nil {
 		o.Logger = slog.Default()
 	}
+}
+
+// authGate is the credential limit, or nil when it was not asked for. Half a
+// limit is not a limit, so both numbers have to be present for it to exist; the
+// lockout period may be left at 0 and the gate derives it.
+func (o Options) authGate() *gateAuth {
+	if o.AuthFailLimit <= 0 || o.AuthFailWindow <= 0 {
+		return nil
+	}
+	return &gateAuth{limit: o.AuthFailLimit, window: o.AuthFailWindow, locked: o.AuthLockout}
 }
 
 // Errors that end a connection.
@@ -187,6 +257,14 @@ type Broker struct {
 	// Options.ACL only seed it; SetRules replaces it.
 	pol policy
 
+	// gate meters connections per source address. Built once by New from
+	// Options and never reconfigured, so accept reads it without a lock.
+	gate *gate
+
+	// proxy resolves the transport header in front of a connection. Nil means the
+	// feature is off, and the accept path then reads no bytes and spawns nothing.
+	proxy *proxyConf
+
 	c counters
 }
 
@@ -214,46 +292,115 @@ type counters struct {
 	tooBig     atomic.Int64
 	kicked     atomic.Int64
 
-	authRejected  atomic.Int64
+	authRejected atomic.Int64
+	// authLocked counts the CONNECTs refused because the address is serving a
+	// credential lockout rather than because its password was wrong. It is the
+	// difference between "a device has the wrong secret" and "a device is being
+	// shut out", and the wire cannot tell an operator which one happened.
+	authLocked    atomic.Int64
 	denyPublish   atomic.Int64
 	denySubscribe atomic.Int64
 	denyDelivery  atomic.Int64
+	// subsOverCap counts SUBSCRIBEs refused for having no room left rather than for
+	// being unauthorized. An operator watching a device stop receiving its topics
+	// needs to tell "the rule file says no" from "it asked for more than it may".
+	subsOverCap atomic.Int64
 
 	tlsConns          atomic.Int64
 	tlsHandshakeFails atomic.Int64
+
+	// The two halves of a refusal have different fixes: a connection limit says
+	// one address is holding too many sockets, a rate limit says it is churning
+	// through them. Collapsing them into one number tells the operator nothing.
+	gateConns atomic.Int64
+	gateRate  atomic.Int64
+
+	// proxyHeader counts sessions whose source address came from a transport
+	// header rather than from the socket. It is the number that says the fleet is
+	// being metered per device; while it stays at zero on a broker behind a load
+	// balancer, every address-keyed decision is being made about the balancer.
+	proxyHeader atomic.Int64
+	// proxyRefused counts sockets closed at the header stage: no header where one
+	// was required, a header that did not parse, or a header from an address that
+	// was never allowed to report one. The last of the three is an attempt to
+	// borrow somebody else's identity, so it is counted even though the connection
+	// is refused either way.
+	proxyRefused atomic.Int64
 }
 
 // Metrics is a snapshot of broker counters.
 type Metrics struct {
-	ID               string `json:"id"`
-	TotalConns       int64  `json:"total_connections"`
-	Online           int64  `json:"online"`
-	MessagesIn       int64  `json:"messages_in"`
-	MessagesOut      int64  `json:"messages_out"`
-	BytesIn          int64  `json:"bytes_in"`
-	BytesOut         int64  `json:"bytes_out"`
-	Subscriptions    int    `json:"subscriptions"`
-	Retained         int    `json:"retained_messages"`
-	QueueSpills      int64  `json:"queue_spills"`
-	Malformed        int64  `json:"malformed_packets"`
-	ProtocolErrors   int64  `json:"protocol_errors"`
-	Rejected         int64  `json:"rejected_connections"`
-	Dropped          int64  `json:"dropped_messages"`
-	ExpiredMessages  int64  `json:"expired_messages"`
-	ExpiredSessions  int64  `json:"expired_sessions"`
-	TooLargeForPeer  int64  `json:"dropped_over_peer_max_packet_size"`
-	DisconnectsSent  int64  `json:"server_disconnects"`
-	AuthRejected     int64  `json:"auth_rejected"`
-	DeniedPublish    int64  `json:"acl_denied_publish"`
-	DeniedSubscribe  int64  `json:"acl_denied_subscribe"`
-	DeniedDelivery   int64  `json:"acl_denied_delivery"`
-	UnsafeExpansions int64  `json:"acl_unsafe_expansions"`
-	ConnectionsTLS   int64  `json:"connections_tls"`
+	ID            string `json:"id"`
+	TotalConns    int64  `json:"total_connections"`
+	Online        int64  `json:"online"`
+	MessagesIn    int64  `json:"messages_in"`
+	MessagesOut   int64  `json:"messages_out"`
+	BytesIn       int64  `json:"bytes_in"`
+	BytesOut      int64  `json:"bytes_out"`
+	Subscriptions int    `json:"subscriptions"`
+	Retained      int    `json:"retained_messages"`
+	QueueSpills   int64  `json:"queue_spills"`
+	// The store's own three numbers. The counters above say what the running
+	// broker holds in memory; these say what the durable half still owes an
+	// absent client, which is the memory a burst leaves behind and the file an
+	// operator has to keep room for.
+	StoreSessions    int64 `json:"store_sessions"`
+	StoreQueued      int64 `json:"store_queued"`
+	StoreDiskBytes   int64 `json:"store_bytes"`
+	Malformed        int64 `json:"malformed_packets"`
+	ProtocolErrors   int64 `json:"protocol_errors"`
+	Rejected         int64 `json:"rejected_connections"`
+	Dropped          int64 `json:"dropped_messages"`
+	ExpiredMessages  int64 `json:"expired_messages"`
+	ExpiredSessions  int64 `json:"expired_sessions"`
+	TooLargeForPeer  int64 `json:"dropped_over_peer_max_packet_size"`
+	DisconnectsSent  int64 `json:"server_disconnects"`
+	AuthRejected     int64 `json:"auth_rejected"`
+	DeniedPublish    int64 `json:"acl_denied_publish"`
+	DeniedSubscribe  int64 `json:"acl_denied_subscribe"`
+	DeniedDelivery   int64 `json:"acl_denied_delivery"`
+	UnsafeExpansions int64 `json:"acl_unsafe_expansions"`
+	ConnectionsTLS   int64 `json:"connections_tls"`
 	// TLSHandshakeFailures counts handshakes that never became a session: a
 	// wrong CA, a client certificate this broker does not trust, a peer that
 	// connected and went silent. Every one is a device that could not connect,
 	// so a growing number here with a flat connections_tls is the signal.
 	TLSHandshakeFailures int64 `json:"tls_handshake_failures"`
+	// AuthLockoutRefusals counts CONNECTs refused because the source address is
+	// serving a credential lockout — correct password included, which is the price
+	// of making the refusal indistinguishable from a wrong secret.
+	// AuthLockedAddresses is how many addresses are locked out right now.
+	AuthLockoutRefusals int64 `json:"auth_lockout_refusals"`
+	AuthLockedAddresses int   `json:"auth_locked_addresses"`
+	// RefusedPerIPConns and RefusedPerIPRate are sockets the per-address gate
+	// closed before reading a byte. They are the only sign a connect storm ever
+	// happened: the peer is never told why, so nothing else records it. Both stay
+	// at zero while the gate is switched off.
+	RefusedPerIPConns int64 `json:"refused_over_per_ip_connection_limit"`
+	RefusedPerIPRate  int64 `json:"refused_over_per_ip_connect_rate"`
+	// GateEntries is how many source addresses the gate is holding. Under an
+	// attack that introduces new addresses it should stay flat: prune drops the
+	// idle ones. Off, it is always zero.
+	GateEntries int `json:"per_ip_gate_entries"`
+	// GateHeld is the sockets the gate is counting right now. It is the number
+	// that says whether a limit is about to bite rather than the one that already
+	// did, and it stays at zero while the gate is off.
+	GateHeld int64 `json:"per_ip_gate_held_sockets"`
+	// SubsOverCap counts SUBSCRIBEs refused because the client already holds
+	// -max-subs filters. It is separate from acl_denied_subscribe because the two
+	// have opposite fixes: one is a rule file to edit, the other is a device
+	// behaving badly or a limit set below the fleet's real subscription count.
+	SubsOverCap int64 `json:"refused_over_subscription_cap"`
+	// ConnectionsProxy counts sessions whose source address came from a transport
+	// header rather than from the socket. On a broker behind a load balancer this
+	// is the number that says the fleet is metered per device: while it stays at
+	// zero, every address-keyed limit and rule is being applied to the balancer.
+	// RefusedProxy counts sockets closed at the header stage — no header where one
+	// was required, one that did not parse, or one from an address that may not
+	// report another's. The last of those is an attempt to borrow an identity, so
+	// it is counted even though the connection is refused either way.
+	ConnectionsProxy int64 `json:"connections_over_proxy_header"`
+	RefusedProxy     int64 `json:"refused_over_proxy_header"`
 	// RulesGeneration starts at 1 and rises once per policy swap, so an operator
 	// reloading a rule file can tell which copy a decision was made against.
 	// RulesLoadedUnix is when that generation became the live one.
@@ -270,6 +417,7 @@ func (b *Broker) Serving() bool { return b.started.Load() && !b.stopping.Load() 
 // Metrics returns the current counters.
 func (b *Broker) Metrics() Metrics {
 	rs := b.pol.load()
+	st := b.store.Stats()
 	m := Metrics{
 		ID:              b.opt.ID,
 		TotalConns:      b.c.totalConns.Load(),
@@ -281,6 +429,9 @@ func (b *Broker) Metrics() Metrics {
 		Subscriptions:   b.tree.Count(),
 		Retained:        b.retain.Len(),
 		QueueSpills:     b.c.spills.Load(),
+		StoreSessions:   int64(st.Sessions),
+		StoreQueued:     st.Queued,
+		StoreDiskBytes:  storeDiskBytes(b.opt.Durable),
 		Malformed:       b.c.malformed.Load(),
 		ProtocolErrors:  b.c.protoErr.Load(),
 		Rejected:        b.c.rejected.Load(),
@@ -295,7 +446,16 @@ func (b *Broker) Metrics() Metrics {
 		DeniedDelivery:  b.c.denyDelivery.Load(),
 		ConnectionsTLS:  b.c.tlsConns.Load(),
 
+		AuthLockoutRefusals:  b.c.authLocked.Load(),
+		AuthLockedAddresses:  b.gate.lockedCount(),
 		TLSHandshakeFailures: b.c.tlsHandshakeFails.Load(),
+		RefusedPerIPConns:    b.c.gateConns.Load(),
+		RefusedPerIPRate:     b.c.gateRate.Load(),
+		GateEntries:          b.gate.tracked(),
+		GateHeld:             b.gate.held(),
+		SubsOverCap:          b.c.subsOverCap.Load(),
+		ConnectionsProxy:     b.c.proxyHeader.Load(),
+		RefusedProxy:         b.c.proxyRefused.Load(),
 		RulesGeneration:      rs.generation,
 		RulesLoadedUnix:      rs.loadedUnix,
 	}
@@ -323,6 +483,9 @@ func New(opt Options) *Broker {
 		cancel: cancel,
 	}
 	b.pol.init(opt.Auth, opt.ACL)
+	b.gate = newGate(opt.MaxConnsPerIP, opt.ConnectRatePerIP, opt.ConnectBurstPerIP,
+		opt.authGate(), &b.c, opt.Logger.With("component", "gate", "id", opt.ID))
+	b.proxy = newProxyConf(opt, opt.Logger.With("component", "proxy", "id", opt.ID))
 	return b
 }
 
@@ -442,18 +605,77 @@ func (b *Broker) acceptLoop(l net.Listener, secure bool) error {
 			}
 			return err
 		}
-		if secure {
-			b.acceptTLS(conn)
-		} else {
-			b.accept(conn)
-		}
+		b.handleOne(conn, secure)
 	}
 }
 
-func (b *Broker) accept(conn net.Conn) {
+// handleOne takes one accepted socket as far as it can go without blocking the
+// accept loop. Without a transport header to read that is exactly the old path:
+// meter the address, hand the connection to its transport, all on the loop, no
+// goroutine spent on a socket that is about to be closed.
+//
+// With a header to read, the work moves to a goroutine of its own — reading a
+// prefix is the peer's schedule, not ours, and a peer that never sends one would
+// otherwise stop everyone else from being accepted for the full timeout. The cost
+// is one short-lived goroutine per connection, which is the same trade the TLS
+// handshake already makes, and it is measured rather than assumed (see the
+// transport-header rows of the capacity baseline).
+func (b *Broker) handleOne(conn net.Conn, secure bool) {
+	if b.proxy == nil {
+		p, ok := b.admit(conn)
+		if !ok {
+			return
+		}
+		b.dispatch(conn, p, secure)
+		return
+	}
+	b.wg.Add(1)
+	go func() {
+		defer b.wg.Done()
+		resolved, ok := b.attach(conn)
+		if !ok {
+			return
+		}
+		p, ok := b.admit(resolved)
+		if !ok {
+			return
+		}
+		b.dispatch(resolved, p, secure)
+	}()
+}
+
+// dispatch hands an admitted connection to the transport that owns it.
+func (b *Broker) dispatch(conn net.Conn, p *permit, secure bool) {
+	if secure {
+		b.acceptTLS(conn, p)
+		return
+	}
+	b.accept(conn, p)
+}
+
+// admit asks the per-address gate for one connection's worth of room. A false
+// answer means the socket is already closed and nothing else happened: no
+// goroutine, no read deadline, no session that would have to be timed out.
+//
+// The gate's own switch is checked here rather than inside acquire so that a
+// broker running without connection limits parses no address and takes no lock —
+// including a broker that only armed the credential half of the gate.
+func (b *Broker) admit(conn net.Conn) (*permit, bool) {
+	if !b.gate.connMetered {
+		return offPermit, true
+	}
+	p, _ := b.gate.acquire(peerIP(conn))
+	if p == nil {
+		_ = conn.Close()
+		return nil, false
+	}
+	return p, true
+}
+
+func (b *Broker) accept(conn net.Conn, p *permit) {
 	b.c.totalConns.Add(1)
 	b.noDelay(conn)
-	c := newClient(b, conn)
+	c := newClient(b, conn, p)
 	b.wg.Add(3)
 	go func() { defer b.wg.Done(); c.readLoop() }()
 	go func() { defer b.wg.Done(); c.writeLoop() }()
@@ -461,7 +683,9 @@ func (b *Broker) accept(conn net.Conn) {
 }
 
 // acceptTLS negotiates TLS before a session exists, so a peer that never finishes
-// the handshake costs one short-lived goroutine and nothing else. The handshake
+// the handshake costs one short-lived goroutine and nothing else — except that
+// with the gate switched on it also costs the address a slot for as long as the
+// handshake is outstanding, which is precisely the window a stalled peer exploits. The handshake
 // cannot run on the accept loop: a peer that opens the socket and goes silent
 // would then stop the broker from accepting anyone else for the full timeout.
 //
@@ -472,7 +696,7 @@ func (b *Broker) accept(conn net.Conn) {
 // total_connections never moves. So when TLSConfig asks for a client certificate, a
 // secure session that reaches CONNECT already holds a chain that verified against
 // ClientCAs, and the certificate rules can rely on that rather than re-checking it.
-func (b *Broker) acceptTLS(conn net.Conn) {
+func (b *Broker) acceptTLS(conn net.Conn, p *permit) {
 	b.wg.Add(1)
 	go func() {
 		defer b.wg.Done()
@@ -480,6 +704,11 @@ func (b *Broker) acceptTLS(conn net.Conn) {
 		ctx, cancel := context.WithTimeout(b.ctx, b.opt.HandshakeTimeout)
 		defer cancel()
 		if err := sc.HandshakeContext(ctx); err != nil {
+			// The permit is given back here because this is where it dies: a failed
+			// handshake produces no client, so no cleanup path would ever release
+			// it. Deferring the release instead would hand the slot back the moment
+			// this goroutine returned, while the session it paid for was live.
+			p.release()
 			b.c.tlsHandshakeFails.Add(1)
 			// Warn, not debug: every one of these is a device that could not
 			// connect, and "unknown certificate authority" is the answer to the
@@ -490,7 +719,8 @@ func (b *Broker) acceptTLS(conn net.Conn) {
 			return
 		}
 		b.c.tlsConns.Add(1)
-		b.accept(sc)
+		// The session takes ownership of the permit now; its cleanup releases it.
+		b.accept(sc, p)
 	}()
 }
 
@@ -511,15 +741,17 @@ func (b *Broker) noDelay(conn net.Conn) {
 	}
 }
 
-// tcpConn finds the TCP connection underneath conn, unwrapping a TLS conn: the
-// deadline that matters is the socket's, and a TLS record is just bytes on it.
-// Without this, every secure connection would run with Nagle enabled.
+// tcpConn finds the TCP connection underneath conn, unwrapping anything that says
+// it is sitting on another connection: a TLS record is just bytes on the socket,
+// and so is a transport header. Without this, every secure or proxied connection
+// would run with Nagle switched on, which is a stall of tens to hundreds of
+// milliseconds per round trip rather than a tuning detail.
 func tcpConn(conn net.Conn) *net.TCPConn {
 	for {
 		switch c := conn.(type) {
 		case *net.TCPConn:
 			return c
-		case *tls.Conn:
+		case interface{ NetConn() net.Conn }:
 			conn = c.NetConn()
 		default:
 			return nil
@@ -658,6 +890,9 @@ func (b *Broker) unregister(c *client) {
 // queueOffline appends a message to a disconnected client's stored session.
 // The identity that authorised the delivery is recorded so a later delivery to
 // the same client id is checked against it too.
+//
+// Every append is a queue_spills: the counter is how an operator sees offline
+// queueing at all, so it must not wait for the queue to overflow to start moving.
 func (b *Broker) queueOffline(clientID string, msg store.Message, id rules.Identity) {
 	b.offlineMu.Lock()
 	defer b.offlineMu.Unlock()
@@ -676,10 +911,10 @@ func (b *Broker) queueOffline(clientID string, msg store.Message, id rules.Ident
 		}
 	}
 	s.Queued = append(s.Queued, msg)
+	b.c.spills.Add(1)
 	if over := len(s.Queued) - b.opt.QueueMax; over > 0 {
 		s.Queued = s.Queued[over:]
 		b.c.dropped.Add(int64(over))
-		b.c.spills.Add(1)
 		b.log.Warn("offline queue overflow, oldest dropped",
 			"client", clientID, "queue_max", b.opt.QueueMax)
 	}
@@ -703,7 +938,6 @@ func (b *Broker) mergeSession(s *store.Session) {
 	if over := len(s.Queued) - b.opt.QueueMax; over > 0 {
 		s.Queued = s.Queued[over:]
 		b.c.dropped.Add(int64(over))
-		b.c.spills.Add(1)
 	}
 	if err := b.store.Put(s); err != nil {
 		b.log.Error("cannot persist session", "client", s.ClientID, "err", err)
@@ -812,7 +1046,8 @@ func (b *Broker) resolvePendingWill(clientID string, continues bool) {
 }
 
 // reap is the broker's clock: it publishes wills whose delay has elapsed,
-// expires offline sessions and prunes retained messages that ran out.
+// expires offline sessions, prunes retained messages that ran out and forgets
+// gate buckets whose address has gone quiet.
 func (b *Broker) reap() {
 	tick := time.NewTicker(b.opt.ReapInterval)
 	defer tick.Stop()
@@ -831,6 +1066,7 @@ func (b *Broker) reap() {
 				}
 				b.log.Debug("retained messages expired", "count", len(gone))
 			}
+			b.gate.prune()
 		}
 	}
 }
@@ -861,15 +1097,17 @@ func (b *Broker) fireDueWills(now time.Time) {
 // expireOfflineSessions ends the sessions whose Session Expiry Interval has
 // passed. A client that is connected again owns its own session, so it is never
 // expired underneath itself.
+//
+// The store is asked for the dead identifiers rather than for Sessions(): this
+// runs on every reap tick, and copying the whole queued payload of every offline
+// client to read one timestamp is a cost that grows with exactly the backlog a
+// busy broker is already spending its time on.
 func (b *Broker) expireOfflineSessions(now time.Time) {
-	for _, s := range b.store.Sessions() {
-		if s.Expiry.IsZero() || now.Before(s.Expiry) {
+	for _, clientID := range b.store.Expired(now) {
+		if b.lookup(clientID) != nil {
 			continue
 		}
-		if b.lookup(s.ClientID) != nil {
-			continue
-		}
-		b.expireSession(s.ClientID)
+		b.expireSession(clientID)
 	}
 }
 

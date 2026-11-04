@@ -89,3 +89,15 @@ func (b *Broker) forgetWill(clientID string) {
 		b.log.Error("cannot forget a delayed will", "client", clientID, "err", err)
 	}
 }
+
+// diskSized is the part of a durable store that can report its own footprint.
+// Only a file-backed store answers; a broker without -store then reports zero
+// bytes on disk, which is the truth rather than a number that is missing.
+type diskSized interface{ DiskBytes() int64 }
+
+func storeDiskBytes(d store.Durable) int64 {
+	if ds, ok := d.(diskSized); ok {
+		return ds.DiskBytes()
+	}
+	return 0
+}

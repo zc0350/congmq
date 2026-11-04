@@ -110,7 +110,7 @@ jobs:
           sleep 1
           (cd test && CONGMQ_PORT=1883 node rules-check.mjs)
 
-      # These three start and kill their own brokers; they only need the binaries.
+      # These five start and kill their own brokers; they only need the binaries.
       - name: tls-check.mjs (TLS / mTLS)
         run: (cd test && node tls-check.mjs)
 
@@ -120,9 +120,113 @@ jobs:
       - name: crash-check.mjs (kill -9 and recover)
         run: (cd test && node crash-check.mjs)
 
+      - name: abuse-check.mjs (per-address gate, lockout, subscription cap)
+        run: (cd test && node abuse-check.mjs)
+
+      # The balancer in this one is a mini proxy inside the harness process, so the
+      # headers on the wire come from a second language's idea of the specification.
+      # That is the point: the Go suite and the Go parser share a byte order, and only
+      # an outside writer can show the bytes are the ones a real load balancer sends.
+      - name: proxy-check.mjs (PROXY protocol v1/v2, trusted proxy list)
+        run: (cd test && node proxy-check.mjs)
+
+  # The deployment shape, run for real. Nothing above exercises Dockerfile,
+  # deploy/docker-compose.yml or the nginx config — they are text until something
+  # starts them, and a broken image is exactly the failure an operator meets first.
+  # nginx here is not a stand-in: it is a third-party load balancer writing its own
+  # PROXY header, which is the strongest available proof that the bytes we parse are
+  # the bytes other people send.
+  docker:
+    name: container + load balancer
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: build the image the way an operator does
+        run: docker build -t congmq:ci .
+
+      - name: it is the binary this tree built, running as it claims
+        run: |
+          set -euo pipefail
+          want=$(sed -n 's/^const version = "\(.*\)"$/\1/p' cmd/congmq/main.go)
+          # -version 打的是 "congmq 1.0.0"，取第二个字段再比。
+          got=$(docker run --rm congmq:ci -version | awk '{print $2}')
+          if [ "$want" != "$got" ]; then echo "::error::image reports '$got', source says '$want'"; exit 1; fi
+          echo "image -version == $got"
+          # 1883 > 1024，所以非 root 绑定不需要 CAP_NET_BIND_SERVICE；而 k8s 的
+          # runAsNonRoot 只认这个 uid——这一行挂了说明镜像偷偷退回 root 了。
+          who=$(docker run --rm --entrypoint id congmq:ci)
+          echo "$who"
+          echo "$who" | grep -q 'uid=10001'
+
+      - name: bring up the shipped topology (nginx PROXY protocol -> congmq)
+        working-directory: deploy
+        run: |
+          set -euo pipefail
+          docker compose up -d --build
+          # service_healthy 已经挡在 depends_on 里，60s 上限再兜一次：
+          # 起不来要当场看见 compose ps 和两边的日志，而不是让 job 空转到 timeout-minutes。
+          for i in $(seq 1 60); do
+            curl -sf http://127.0.0.1:8080/readyz >/dev/null && break
+            sleep 1
+            if [ "$i" = 60 ]; then docker compose ps; docker compose logs --no-color; exit 1; fi
+          done
+          docker compose ps
+
+      - name: a device talks to the broker through a real load balancer
+        run: (cd test && npm ci --no-audit --no-fund && node lb-smoke.mjs)
+
+      - name: and the counters say the header is what made the address real
+        run: |
+          curl -s http://127.0.0.1:8080/metrics | jq '{connections_over_proxy_header, refused_over_proxy_header, online, total_connections}'
+          curl -s http://127.0.0.1:8080/metrics.txt | grep -E '^congmq_(connections|refused)_over_proxy_header'
+
+      - name: an edit to the rules on the host reaches the running container
+        working-directory: deploy
+        run: |
+          set -euo pipefail
+          before=$(curl -s http://127.0.0.1:8080/metrics | jq -r .rules_generation)
+          # 追加的是注释（装载器跳过 # 行，语义没变），但文件指纹变了——这正是不停机运维
+          # 在容器里的那一半形状：宿主机上编辑 bind 进来的文件，容器里 :ro 照读，
+          # 会话一条不掉。generation 不涨就等于挂载路径指错了，
+          # operator 改完规则会以为生效了。语义本身（坏文件回滚、不踢已有会话）
+          # 由 test/reload-check.mjs 钉，这里只证明"改得动"。
+          printf '# appended by CI at %s\n' "$(date -u +%FT%TZ)" >> ../rules/auth.jsonl
+          after=$before
+          for i in $(seq 1 20); do
+            after=$(curl -s http://127.0.0.1:8080/metrics | jq -r .rules_generation)
+            [ "$after" != "$before" ] && break
+            sleep 1
+          done
+          echo "rules_generation $before -> $after"
+          [ "$after" != "$before" ] || { echo "::error::the edited rules never reached the container"; exit 1; }
+          curl -s http://127.0.0.1:8080/metrics | jq -e '.rules_reload_failures == 0' >/dev/null
+
+      - name: a container restart keeps the durable state
+        working-directory: deploy
+        run: |
+          set -euo pipefail
+          docker compose restart congmq
+          for i in $(seq 1 30); do curl -sf http://127.0.0.1:8080/readyz >/dev/null && break; sleep 1; done
+          curl -sf http://127.0.0.1:8080/readyz >/dev/null
+          # -store 落在 named volume 上；"换容器不丢状态"这句话只有真换过一次容器才算证明。
+          docker compose exec -T congmq sh -c 'ls -l /var/lib/congmq/state.log'
+          docker compose logs congmq | grep -E 'msg="store open"' | tail -1
+
+      - if: always()
+        name: container logs
+        working-directory: deploy
+        run: docker compose logs --no-color | tail -120
+
+      - if: always()
+        name: tear down
+        working-directory: deploy
+        run: docker compose down -v
+
   cross-compile:
     name: ${{ matrix.goos }}/${{ matrix.goarch }}${{ matrix.goarm }}
-    needs: [go, conformance]
+    needs: [go, conformance, docker]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -176,8 +280,17 @@ jobs:
           # 归档里保持和仓库一样的目录：README 的开发示例写的是
           # `rules/auth.jsonl`，拍平了拷到二进制旁边，照着 README 敲的人会找不到文件。
           mkdir -p "$name/rules"
-          cp README.md "$name/"
+          # MIT 唯一的条件是"分发时必须带上许可声明"。拿走 tar.gz 的人是直接跑起来的，
+          # 不会回来看 git，所以声明跟着二进制走，而不只是躺在源码仓库里。
+          cp LICENSE README.md Dockerfile .dockerignore "$name/"
           cp rules/auth.jsonl rules/acl.jsonl "$name/rules/"
+          # 部署形态跟着二进制走：systemd 那两个文件在归档里就能直接用（StateDirectory
+          # 由 systemd 建，ExecStart 指的就是同目录那个 congmq），Dockerfile 与 compose
+          # 是"官方镜像长什么样"的参照，从 git checkout 里 build 才完整。
+          mkdir -p "$name/deploy/nginx" "$name/deploy/systemd"
+          cp deploy/docker-compose.yml "$name/deploy/"
+          cp deploy/nginx/nginx.conf "$name/deploy/nginx/"
+          cp deploy/systemd/congmq.service deploy/systemd/congmq.default "$name/deploy/systemd/"
           (cd "$name" && sha256sum congmq* > SHA256SUMS.txt)
           if [ "$GOOS" = "windows" ]; then
             zip -qr "dist/${name}.zip" "$name"
@@ -232,6 +345,6 @@ jobs:
             gh release create "$tag" dist/* \
               --title "congmq $tag" \
               --latest \
-              --notes "手写内核的 MQTT 3.1.1 + 5.0 broker，零第三方运行时依赖。每个归档含 congmq / congmq-load / congmq-cert、示例规则文件与 SHA256SUMS.txt；能力、边界与实测容量基线见 README。"
+              --notes "手写内核的 MQTT 3.1.1 + 5.0 broker，零第三方运行时依赖，MIT 许可。每个归档含 congmq / congmq-load / congmq-cert、示例规则文件、Dockerfile 与 deploy/（compose + nginx PROXY protocol 配置 + systemd unit）、LICENSE 与 SHA256SUMS.txt；能力、边界、部署形态与实测容量基线见 README。"
           fi
           gh release view "$tag" --json tagName,assets --jq '.tagName + " -> " + ([.assets[].name] | join(", "))'

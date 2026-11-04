@@ -151,7 +151,23 @@ type Store interface {
 	// file implementation can honour the same sync promise Put does.
 	Delete(clientID string) error
 	Sessions() []*Session
+	// Expired reports the identifiers of sessions whose expiry instant has passed.
+	// The reaper asks once a tick and needs nothing else from the record, so it
+	// must not go through Sessions(): that deep-copies every queued message of
+	// every offline client just to read two fields.
+	Expired(now time.Time) []string
+	// Stats reports what the store is holding right now. It is the only way to
+	// tell a queue the broker still owes from memory it forgot to give back.
+	Stats() Stats
 	Close() error
+}
+
+// Stats is the residency of a store: how many sessions it holds and how many
+// messages are waiting inside them. Queued is the part of a broker's memory a
+// load leaves behind, and the number a capacity plan is really sizing for.
+type Stats struct {
+	Sessions int
+	Queued   int64
 }
 
 // MemoryStore keeps sessions in a map. It survives a client disconnect but
@@ -209,3 +225,28 @@ func (m *MemoryStore) Sessions() []*Session {
 
 // Close is a no-op.
 func (m *MemoryStore) Close() error { return nil }
+
+// Expired reports the sessions that are already dead according to the clock.
+// A zero Expiry never expires, which is how a 3.1.1 session behaves.
+func (m *MemoryStore) Expired(now time.Time) []string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	var out []string
+	for id, s := range m.sessions {
+		if !s.Expiry.IsZero() && !now.Before(s.Expiry) {
+			out = append(out, id)
+		}
+	}
+	return out
+}
+
+// Stats counts the sessions held and the messages queued inside them.
+func (m *MemoryStore) Stats() Stats {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	st := Stats{Sessions: len(m.sessions)}
+	for _, s := range m.sessions {
+		st.Queued += int64(len(s.Queued))
+	}
+	return st
+}

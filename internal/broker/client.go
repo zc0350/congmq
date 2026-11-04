@@ -68,6 +68,10 @@ type client struct {
 	b    *Broker
 	conn net.Conn
 	ip   net.IP
+	// permit is the per-address gate slot this connection paid for before the
+	// socket was read. It is handed back in cleanup, and release is idempotent
+	// because the TLS path gives it back itself when the handshake never lands.
+	permit *permit
 	// certCN is the CommonName of a client certificate this broker verified
 	// during the handshake, or "" for a plain connection and for one where no
 	// chain was checked. It never changes after accept.
@@ -97,11 +101,12 @@ type client struct {
 	keepAliveValue time.Duration
 
 	// Session shape, negotiated in CONNECT and applied when the connection ends.
-	discard        bool
-	persist        bool
-	sessionExpiry  time.Duration
-	sessionForever bool
-	willDelay      time.Duration
+	discard         bool
+	persist         bool
+	sessionExpiry   time.Duration
+	sessionForever  bool
+	requestedExpiry uint32
+	willDelay       time.Duration
 
 	// The peer's own limits, learned from its CONNECT properties.
 	peerReceiveMax int
@@ -124,14 +129,15 @@ type client struct {
 	subject atomic.Pointer[rules.Identity]
 }
 
-func newClient(b *Broker, conn net.Conn) *client {
+func newClient(b *Broker, conn net.Conn, p *permit) *client {
 	size := b.opt.MailboxSize
 	return &client{
 		b:              b,
 		conn:           conn,
 		ip:             peerIP(conn),
+		permit:         p,
 		certCN:         peerCertCN(conn),
-		log:            b.log.With("remote", conn.RemoteAddr().String()),
+		log:            connLog(b.log, conn),
 		in:             make(chan packets.Packet, size),
 		out:            make(chan []byte, size),
 		mailbox:        make(chan *task, size),
@@ -487,6 +493,10 @@ func (c *client) persistLive() {
 // removed from the live map first, so any message the router spills afterwards
 // goes to the store and merges with this snapshot instead of racing it.
 func (c *client) cleanup() {
+	// Every connection that got as far as a client object ends here, connected or
+	// not, so this is where its address stops being charged. A connection refused
+	// before admission never reaches newClient and never needs releasing.
+	c.permit.release()
 	if c.registered {
 		c.b.unregister(c)
 		c.registered = false
@@ -734,6 +744,7 @@ func (c *client) negotiate(p *packets.Connect) error {
 	}
 	c.peerAliasMax = props.TopicAliasMax
 	c.peerMaxPacket = props.MaxPacketSize
+	c.requestedExpiry = props.SessionExpiry
 	c.applySessionExpiry(props.SessionExpiry)
 	c.persist = c.sessionForever || c.sessionExpiry > 0
 	return nil
@@ -741,19 +752,36 @@ func (c *client) negotiate(p *packets.Connect) error {
 
 // applySessionExpiry turns a requested Session Expiry Interval into this
 // session's lifetime, clamped by whatever the operator allows. The all-ones
-// value means the session is never reaped.
+// value means the session is never reaped — unless an operator has named a
+// ceiling, because a session that outlives every clock is the largest thing on
+// that disk bound is trying to hold down.
 func (c *client) applySessionExpiry(seconds uint32) {
+	capped := c.b.opt.SessionExpiryMax > 0 &&
+		(seconds == 0xFFFFFFFF || time.Duration(seconds)*time.Second > c.b.opt.SessionExpiryMax)
 	switch {
+	case capped:
+		c.sessionExpiry = c.b.opt.SessionExpiryMax
+		c.sessionForever = false
 	case seconds == 0xFFFFFFFF:
 		c.sessionExpiry = 0
 		c.sessionForever = true
-	case c.b.opt.SessionExpiryMax > 0 && time.Duration(seconds)*time.Second > c.b.opt.SessionExpiryMax:
-		c.sessionExpiry = c.b.opt.SessionExpiryMax
-		c.sessionForever = false
 	default:
 		c.sessionExpiry = time.Duration(seconds) * time.Second
 		c.sessionForever = false
 	}
+}
+
+// expiryAltered reports whether this session lives for less than the client
+// asked for, which is the one thing about Session Expiry the client cannot
+// discover on its own.
+func (c *client) expiryAltered() bool {
+	if !c.ver.Is5() {
+		return false
+	}
+	if c.sessionForever {
+		return c.requestedExpiry != 0xFFFFFFFF
+	}
+	return c.requestedExpiry != uint32(c.sessionExpiry/time.Second)
 }
 
 // connackProps advertises what this broker will do for a 5.0 client. Anything a
@@ -777,6 +805,13 @@ func (c *client) connackProps(assigned string) *packets.Properties {
 	// Wildcards, retained messages and shared subscriptions are all supported,
 	// which is the default, so only the subscription identifier is asserted.
 	p.SetSubIDAvail(1)
+	// A client that asked for longer than this broker will keep has to be told the
+	// number that is actually in force: the CONNACK value overrides the CONNECT one,
+	// and saying nothing leaves the device planning around an hour of offline queue
+	// that was never promised.
+	if c.expiryAltered() {
+		p.SetSessionExpiry(uint32(c.sessionExpiry / time.Second))
+	}
 	if assigned != "" {
 		p.SetAssignedClientID(assigned)
 	}
@@ -961,6 +996,26 @@ func (c *client) subscribed(filter string) bool {
 	return ok
 }
 
+// outOfSubRoom reports that the session may not take another distinct filter.
+//
+// A SUBSCRIBE of a filter the client already holds is not counted: it replaces the
+// existing one, so the room it needs is already paid for. Refusing it would leave
+// a device at its cap unable to re-negotiate the QoS of a subscription it has,
+// which is a worse outcome than the flood the limit is here to stop.
+//
+// The count is of distinct filters, so it comes back down on its own with an
+// UNSUBSCRIBE; nothing here has to be released.
+func (c *client) outOfSubRoom(filter string) bool {
+	limit := c.b.opt.MaxSubs
+	if limit <= 0 {
+		return false
+	}
+	if c.subscribed(filter) {
+		return false
+	}
+	return len(c.rt.subs) >= limit
+}
+
 // grant validates one requested subscription and files it, returning the reason
 // code the client is told and whether the subscription was actually made.
 func (c *client) grant(sub packets.Subscription, subID int) (byte, bool) {
@@ -975,6 +1030,15 @@ func (c *client) grant(sub packets.Subscription, subID int) (byte, bool) {
 	if !c.b.allowSubscribe(c.identity(), wanted) {
 		c.log.Warn("subscription refused by acl", "client", c.id, "filter", sub.TopicFilter)
 		return c.refuseCode(packets.RNotAuthorized), false
+	}
+	// The cap is asked after the rules on purpose: "you may not subscribe to that"
+	// is the answer that does not depend on how much this client has already asked
+	// for, and a probe that fails both tests should be told the security reason.
+	if c.outOfSubRoom(sub.TopicFilter) {
+		c.b.c.subsOverCap.Add(1)
+		c.log.Warn("subscription refused: per-client limit reached",
+			"client", c.id, "filter", sub.TopicFilter, "max_subs", c.b.opt.MaxSubs)
+		return c.refuseCode(packets.RQuotaExceeded), false
 	}
 	granted := min(sub.MaxQoS, c.b.opt.MaxQoS)
 	stored := store.Sub{

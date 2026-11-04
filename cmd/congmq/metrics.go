@@ -85,6 +85,9 @@ var promText = map[string]promKind{
 	"subscriptions":                     {"Subscription filters registered right now.", "gauge"},
 	"retained_messages":                 {"Retained messages held right now.", "gauge"},
 	"queue_spills":                      {"Messages moved to an offline queue.", "counter"},
+	"store_sessions":                    {"Sessions the durable store is holding right now.", "gauge"},
+	"store_queued":                      {"Messages waiting in the durable store for a client that is away.", "gauge"},
+	"store_bytes":                       {"Bytes of the state file, 0 without -store.", "gauge"},
 	"malformed_packets":                 {"Packets that failed to decode.", "counter"},
 	"protocol_errors":                   {"Packets out of order for the protocol.", "counter"},
 	"rejected_connections":              {"Connections refused before a session existed.", "counter"},
@@ -110,6 +113,28 @@ var promText = map[string]promKind{
 	"tls_cert_reloads":                  {"Certificate rotations that took effect.", "counter"},
 	"tls_cert_reload_failures":          {"Certificate rotations refused; the previous leaf stayed in force.", "counter"},
 	"tls_cert_not_after_unix":           {"When the certificate now in force stops being valid.", "gauge"},
+
+	// The gate's own. Both refusal counters stay at zero while
+	// -max-conns-per-ip, -conn-rate-per-ip and the credential limit are off, and
+	// the two gauges say whether a limit is about to bite rather than the one that
+	// already did. refused_over_subscription_cap is the per-client sibling of the
+	// same idea, so it reads next to them on a dashboard.
+	"refused_over_per_ip_connection_limit": {"Sockets closed because that address already holds the maximum.", "counter"},
+	"refused_over_per_ip_connect_rate":     {"Sockets closed for starting too many connections per second.", "counter"},
+	"per_ip_gate_entries":                  {"Source addresses the gate is tracking right now.", "gauge"},
+	"per_ip_gate_held_sockets":             {"Sockets the gate is counting right now, across every address.", "gauge"},
+	"auth_lockout_refusals":                {"CONNECTs refused because the source address is locked out, correct password included.", "counter"},
+	"auth_locked_addresses":                {"Source addresses serving a credential lockout right now.", "gauge"},
+	"refused_over_subscription_cap":        {"SUBSCRIBEs refused because that client already holds -max-subs filters.", "counter"},
+
+	// The transport header's two numbers. connections_over_proxy_header is the one
+	// that says the fleet is metered per device: behind a balancer, a value stuck at
+	// zero means every address-keyed limit above is being applied to the balancer.
+	// refused_over_proxy_header includes the headers sent by an address that may not
+	// report another's — an attempt to borrow an identity, counted even though the
+	// socket is closed either way.
+	"connections_over_proxy_header": {"Sessions whose client address came from a transport header.", "counter"},
+	"refused_over_proxy_header":     {"Sockets closed at the transport header stage.", "counter"},
 
 	"pid":             {"Process id.", "gauge"},
 	"started_unix":    {"When the process started.", "gauge"},

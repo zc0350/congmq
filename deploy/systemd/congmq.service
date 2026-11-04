@@ -1,0 +1,66 @@
+# 单机部署的落地形态：systemd 管进程，journal 管日志，规则与证书留在 /etc。
+#
+#   sudo useradd --system --home-dir /var/lib/congmq --no-create-home --shell /usr/sbin/nologin congmq
+#   sudo install -m 0755 congmq /usr/local/bin/congmq          # 从 Releases 下的归档，或 go build
+#   sudo cp deploy/systemd/congmq.default /etc/default/congmq
+#   sudo cp deploy/systemd/congmq.service /etc/systemd/system/
+#   sudo cp rules/*.jsonl /etc/congmq/                          # 或改 /etc/default/congmq 指到别处
+#   sudo systemctl daemon-reload && sudo systemctl enable --now congmq
+#
+# 改参数就编辑 /etc/default/congmq 然后 `systemctl restart congmq`；
+# 改规则/证书不用 restart：写回原路径即可（一个轮询周期内生效），
+# 或者 `systemctl reload congmq` 立刻生效（就是发一个 SIGHUP）。
+
+[Unit]
+Description=congmq MQTT broker
+Documentation=https://github.com/zc0350/congmq#readme
+# broker 启动时不做任何外呼，但设备会立刻重连上来，网络没就绪就白跑一轮恢复。
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# 没有 sd_notify：broker 起监听即视为就绪，就绪与否的判据在 /readyz（HTTP），
+# 不在 systemd 的 socket 通知里。
+Type=simple
+EnvironmentFile=-/etc/default/congmq
+ExecStart=/usr/local/bin/congmq $CONGMQ_ARGS
+ExecReload=/bin/kill -HUP $MAINPID
+
+User=congmq
+Group=congmq
+# /var/lib/congmq 由 systemd 创建并交给上面的 uid，ProtectSystem=strict 之下它仍然可写。
+StateDirectory=congmq
+
+# 崩溃恢复是实测过的（test/crash-check.mjs），所以崩了就该自动起来；
+# 起来就丢会话的形态反而是例外——记得 -store 在参数里。
+Restart=on-failure
+RestartSec=2s
+# 先 SIGTERM（关监听 + drain 会话，内部上限 15s），留 5s 余量才 SIGKILL。
+KillSignal=SIGTERM
+TimeoutStopSec=20s
+
+# ---- 只读文件系统 + 最小权限。需要写的地方只有 StateDirectory 那一处。 ----
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+# 只放网络：broker 不 fork、不执行任何外部命令、不读 /proc 之外的系统信息。
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_INET AF_INET6
+# MQTT/TLS/指标 三个口都是 >1024，非 root 绑定不需要任何 capability。
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+# 单机 broker 的容量是按文件描述符数先撞墙的那一类（见 README §9 的连接成本）。
+LimitNOFILE=1048576
+# 会话与离线队列的内存都按连接数走；这里不设 MemoryHigh，
+# 因为被 OOM kill 的 broker 会带着没落盘的最后一批消息一起走。
+
+[Install]
+WantedBy=multi-user.target

@@ -136,6 +136,9 @@ type FileStore struct {
 	opt  FileStoreOptions
 	path string
 	log  *recordLog
+	// lock is the directory's single-writer guard, held for as long as this
+	// store is open. See ErrStoreInUse for what it prevents.
+	lock *dirLock
 
 	mu       sync.Mutex
 	sessions map[string]*Session
@@ -180,10 +183,18 @@ func NewFileStore(opt FileStoreOptions) (*FileStore, error) {
 	if err := os.MkdirAll(opt.Dir, 0o750); err != nil {
 		return nil, err
 	}
+	// Before the file is read, let alone replayed or truncated: the recovery path
+	// cuts a torn tail off the log, so a second writer arriving here would have
+	// its bytes rewritten by the first one's open.
+	lock, err := lockDir(opt.Dir)
+	if err != nil {
+		return nil, err
+	}
 
 	path := filepath.Join(opt.Dir, stateFileName)
 	lg, opened, err := openRecordLog(path, headerRecord())
 	if err != nil {
+		lock.close()
 		return nil, err
 	}
 
@@ -191,6 +202,7 @@ func NewFileStore(opt FileStoreOptions) (*FileStore, error) {
 		opt:       opt,
 		path:      path,
 		log:       lg,
+		lock:      lock,
 		sessions:  make(map[string]*Session),
 		retained:  make(map[string]Message),
 		wills:     make(map[string]Will),
@@ -202,6 +214,7 @@ func NewFileStore(opt FileStoreOptions) (*FileStore, error) {
 	}
 	if err := fs.apply(opened.Records); err != nil {
 		_ = lg.close(false)
+		lock.close()
 		return nil, err
 	}
 	go fs.writer()
@@ -355,6 +368,46 @@ func (fs *FileStore) Sessions() []*Session {
 		out = append(out, s.clone())
 	}
 	return out
+}
+
+// Expired reports the sessions the clock has already run out. It reads the
+// expiry under the lock without detaching anything, because the reaper calls it
+// once a tick and a queue is exactly the part that must not be copied then.
+func (fs *FileStore) Expired(now time.Time) []string {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	var out []string
+	for id, s := range fs.sessions {
+		if !s.Expiry.IsZero() && !now.Before(s.Expiry) {
+			out = append(out, id)
+		}
+	}
+	return out
+}
+
+// Stats counts the sessions held and the messages queued inside them.
+func (fs *FileStore) Stats() Stats {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	st := Stats{Sessions: len(fs.sessions)}
+	for _, s := range fs.sessions {
+		st.Queued += int64(len(s.Queued))
+	}
+	return st
+}
+
+// DiskBytes reports the size of the state file right now. Compaction promises
+// that the file is the size of what the store still holds plus what has been
+// appended since the last rewrite, and this is the only number that can prove
+// either half of that sentence from outside the process.
+func (fs *FileStore) DiskBytes() int64 {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	info, err := fs.log.f.Stat()
+	if err != nil {
+		return 0
+	}
+	return info.Size()
 }
 
 // LoadRetained returns the retained messages left on disk, by topic.
@@ -538,6 +591,7 @@ func (fs *FileStore) Close() error {
 }
 
 func (fs *FileStore) closeLocked() {
+	defer fs.lock.close()
 	close(fs.stop)
 	<-fs.done
 	if err := fs.Compact(); err != nil {
@@ -560,5 +614,6 @@ func (fs *FileStore) crash() {
 		close(fs.stop)
 		<-fs.done
 		_ = fs.log.f.Close()
+		fs.lock.close()
 	})
 }

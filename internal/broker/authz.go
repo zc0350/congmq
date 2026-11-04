@@ -64,15 +64,30 @@ func subjectOf(p *packets.Connect, ip net.IP, certCN string) rules.Identity {
 // stays open, which is how it behaved before rules existed. A client that
 // offers no username is still passed through: an empty name simply matches the
 // rules the operator wrote for it.
+//
+// The address lockout is asked before the credentials are, and answers with the
+// same code a wrong password gets. Sleeping here would be the intuitive way to
+// slow a brute-force run down, and it is the wrong one: a suspended attempt still
+// holds a socket and three goroutines, so the penalty lands on the broker rather
+// than on the attacker. Refusing costs one frame write and no waiting.
 func (b *Broker) authenticate(id rules.Identity, password string) bool {
 	rs := b.pol.load()
 	if rs.auth == nil {
 		return true
 	}
+	// The lockout is counted separately from authRejected because the two answers
+	// mean opposite things to whoever is debugging: "this device has the wrong
+	// secret" and "this device is being shut out even though it may be right".
+	if b.gate.locked(id.IP) {
+		b.c.authLocked.Add(1)
+		return false
+	}
 	if rs.auth.Authenticate(id, password) {
+		b.gate.noteAuthSuccess(id.IP)
 		return true
 	}
 	b.c.authRejected.Add(1)
+	b.gate.noteAuthFailure(id.IP)
 	return false
 }
 

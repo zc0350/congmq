@@ -6,6 +6,8 @@
 //   node load-baseline.mjs
 //   node load-baseline.mjs --groups=pump,fsync --seconds=15
 //   node load-baseline.mjs --groups=tls --seconds=20   # the plain/TLS pair
+//   node load-baseline.mjs --groups=gate               # the per-address gate, armed and off
+//   node load-baseline.mjs --groups=proxy              # the transport header, and the gate behind it
 //   CONGMQ_BIN=... CONGMQ_LOAD_BIN=... node load-baseline.mjs --out=baseline.md
 //
 // Every row gets its own broker, its own ports and its own -store directory:
@@ -34,7 +36,7 @@ const argv = Object.fromEntries(
   }),
 );
 const SECONDS = Number(argv.seconds ?? process.env.CONGMQ_LOAD_SECONDS ?? 10);
-const GROUPS = (argv.groups ?? 'conns,pump,payload,fanout,fsync,tls').split(',').map((g) => g.trim());
+const GROUPS = (argv.groups ?? 'conns,gate,proxy,pump,payload,fanout,fsync,tls').split(',').map((g) => g.trim());
 const OUT = argv.out ?? `baseline-${new Date().toISOString().slice(0, 10)}.md`;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -63,7 +65,7 @@ function genPKI() {
   });
 }
 
-async function startBroker({ sync, store, queueMax = 1000, tls = false }) {
+async function startBroker({ sync, store, queueMax = 1000, tls = false, extra = [] }) {
   const args = [
     '-addr', `127.0.0.1:${PORT}`,
     '-metrics', `127.0.0.1:${METRICS_PORT}`,
@@ -71,6 +73,7 @@ async function startBroker({ sync, store, queueMax = 1000, tls = false }) {
     '-store-sync', sync,
     '-store-flush-interval', '1s',
     '-queue-max', String(queueMax),
+    ...extra,
   ];
   if (tls) {
     args.push('-tls-addr', `127.0.0.1:${TLSPORT}`, '-tls-cert', join(pki, 'server.crt'), '-tls-key', join(pki, 'server.key'));
@@ -165,6 +168,18 @@ async function removeDir(dir) {
 
 const PUBSUB = ['-publishers', '8', '-subscribers', '8', '-window', '100'];
 
+// The gate rows stay at 3,000 connections on purpose. Windows hands one
+// ephemeral port to every dial and holds it in TIME_WAIT afterwards, so a second
+// 10,000-connection row on the same box fails to dial at all — and a row whose
+// sockets never reached the broker measures nothing, gate counters prove it.
+const GATE_CONNS = 3000;
+
+// The two rows that put a cap on the table stay at 1,000 because the point is the
+// arithmetic: a 600 limit and two claimed addresses is a 1,200-address-headroom
+// broker, so every connection must be held. With one socket address the same
+// broker holds 600 and turns 400 away, and that difference is the feature.
+const PROXY_GATE_CONNS = 1000;
+
 const rows = [
   ...GROUPS.includes('conns')
     ? [1000, 5000, 10000].map((n) => ({
@@ -174,6 +189,90 @@ const rows = [
         sync: 'everysec',
         loader: ['-mode', 'conns', '-conns', String(n), '-proto', '5', '-seconds', String(SECONDS)],
       }))
+    : [],
+  ...GROUPS.includes('gate')
+    ? [
+        {
+          group: 'gate',
+          label: `${comma(GATE_CONNS)} 建连 · 闸门全关（默认）`,
+          sync: 'everysec',
+          loader: ['-mode', 'conns', '-conns', String(GATE_CONNS), '-proto', '5', '-seconds', String(SECONDS)],
+        },
+        {
+          group: 'gate',
+          label: `${comma(GATE_CONNS)} 建连 · 闸门开着但一个都没卡`,
+          sync: 'everysec',
+          // Everything armed, nothing binding: the cost of the meter itself, with
+          // the counters as the proof that no connection was turned away.
+          brokerArgs: ['-max-conns-per-ip', '20000', '-conn-rate-per-ip', '20000', '-conn-burst-per-ip', '20000'],
+          loader: ['-mode', 'conns', '-conns', String(GATE_CONNS), '-proto', '5', '-seconds', String(SECONDS)],
+        },
+        {
+          group: 'gate',
+          label: `${comma(GATE_CONNS)} 建连 · -max-conns-per-ip 500`,
+          sync: 'everysec',
+          brokerArgs: ['-max-conns-per-ip', '500'],
+          loader: ['-mode', 'conns', '-conns', String(GATE_CONNS), '-proto', '5', '-seconds', String(SECONDS)],
+        },
+        {
+          group: 'gate',
+          label: `${comma(GATE_CONNS)} 建连 · -conn-rate-per-ip 300`,
+          sync: 'everysec',
+          brokerArgs: ['-conn-rate-per-ip', '300', '-conn-burst-per-ip', '300'],
+          loader: ['-mode', 'conns', '-conns', String(GATE_CONNS), '-proto', '5', '-seconds', String(SECONDS)],
+        },
+      ]
+    : [],
+  // The first four rows differ in one thing: what the broker was told to read in
+  // front of the payload, and what the loader therefore had to write. The last two
+  // are the reason the feature exists at all — the same per-address cap, once with
+  // the device addresses the header claims and once without, and the difference is
+  // how many of a thousand connections the broker is willing to hold.
+  ...GROUPS.includes('proxy')
+    ? [
+        {
+          group: 'proxy',
+          label: `${comma(GATE_CONNS)} 长连接 · 头部 off（默认）`,
+          sync: 'everysec',
+          loader: ['-mode', 'conns', '-conns', String(GATE_CONNS), '-proto', '5', '-seconds', String(SECONDS)],
+        },
+        {
+          group: 'proxy',
+          label: `${comma(GATE_CONNS)} 长连接 · require + v1 文本`,
+          sync: 'everysec',
+          brokerArgs: ['-proxy-protocol', 'require'],
+          loader: ['-mode', 'conns', '-conns', String(GATE_CONNS), '-proto', '5', '-seconds', String(SECONDS), '-proxy-header', 'v1'],
+        },
+        {
+          group: 'proxy',
+          label: `${comma(GATE_CONNS)} 长连接 · require + v2 二进制`,
+          sync: 'everysec',
+          brokerArgs: ['-proxy-protocol', 'require'],
+          loader: ['-mode', 'conns', '-conns', String(GATE_CONNS), '-proto', '5', '-seconds', String(SECONDS), '-proxy-header', 'v2'],
+        },
+        {
+          group: 'proxy',
+          label: `${comma(GATE_CONNS)} 长连接 · trusted + v1（名单 127.0.0.0/8）`,
+          sync: 'everysec',
+          brokerArgs: ['-proxy-protocol', 'trusted', '-trusted-proxy-cidr', '127.0.0.0/8'],
+          loader: ['-mode', 'conns', '-conns', String(GATE_CONNS), '-proto', '5', '-seconds', String(SECONDS), '-proxy-header', 'v1'],
+        },
+        {
+          group: 'proxy',
+          label: `${comma(PROXY_GATE_CONNS)} 长连接 · 闸门 600 + 两个申报地址（require + v1）`,
+          sync: 'everysec',
+          brokerArgs: ['-proxy-protocol', 'require', '-max-conns-per-ip', '600'],
+          loader: ['-mode', 'conns', '-conns', String(PROXY_GATE_CONNS), '-proto', '5', '-seconds', String(SECONDS),
+            '-proxy-header', 'v1', '-proxy-src', '203.0.113.7,198.51.100.9'],
+        },
+        {
+          group: 'proxy',
+          label: `${comma(PROXY_GATE_CONNS)} 长连接 · 同一闸门、头部 off（对照）`,
+          sync: 'everysec',
+          brokerArgs: ['-max-conns-per-ip', '600'],
+          loader: ['-mode', 'conns', '-conns', String(PROXY_GATE_CONNS), '-proto', '5', '-seconds', String(SECONDS)],
+        },
+      ]
     : [],
   ...GROUPS.includes('pump')
     ? [
@@ -263,6 +362,8 @@ const table = (headers, body) =>
 
 const groupName = {
   conns: '连接成本（idle connection cost）',
+  gate: '接入闸门的代价（per-address gate）',
+  proxy: '传输头部的代价（PROXY protocol）',
   pump: 'QoS 吞吐',
   payload: '载荷大小',
   fanout: '扇入扇出',
@@ -295,6 +396,64 @@ function renderConns(got) {
         perConn(rep, settled, 'mem_sys_bytes'),
         perConn(rep, settled, 'mem_alloc_bytes'),
         perConn(rep, first, 'mem_alloc_bytes'),
+      ];
+    }),
+  );
+}
+
+// The gate is only worth shipping if both halves of this table hold: an armed
+// gate that refuses nothing must cost the same as one switched off, and an armed
+// gate that refuses must cost the *survivors* the same as well. The refusals come
+// from the cumulative counters, so they are read after the run rather than from a
+// sample taken while the ramp was still in progress.
+function renderGate(got) {
+  return table(
+    ['场景', '计划建连', '连上', '压测端报错', 'broker 在线', '闸门拒绝（并发/速率）', '表项/持有 socket', 'goroutines', 'mem_sys (MiB)', '每连接活跃'],
+    got.map(({ row, rep, after }) => {
+      // Online and held sockets come from the sample taken while the loader was
+      // still holding its connections; the refusals are cumulative, so the final
+      // read is the one that has counted the whole ramp.
+      const settled = rep.broker_settled ?? rep.broker_during ?? {};
+      return [
+        row.label,
+        comma(rep.planned_connections),
+        comma(rep.connected),
+        String(rep.connect_errors),
+        comma(settled.online),
+        `${comma(after?.refused_over_per_ip_connection_limit)} / ${comma(after?.refused_over_per_ip_connect_rate)}`,
+        `${comma(after?.per_ip_gate_entries)} / ${comma(settled.per_ip_gate_held_sockets)}`,
+        comma(settled.goroutines),
+        mib(settled.mem_sys_bytes),
+        perConn(rep, settled, 'mem_alloc_bytes'),
+      ];
+    }),
+  );
+}
+
+// The header rows read like the gate rows because the question is the same one:
+// what does the feature cost when it decides nothing, and what does it cost when
+// it decides everything. The two columns only this table has are the pair that
+// says the header was the path the load actually came in on — a row where the
+// broker credited fewer sessions than the loader held is a row about something
+// else, and the last two rows are the point of the whole feature: one cap, twice
+// the headroom, because the gate is counting devices instead of one balancer.
+function renderProxy(got) {
+  return table(
+    ['场景', '计划建连', '连上', '压测端报错', 'broker 在线', '头部会话/头部拒绝', '闸门拒绝', '表项/持有 socket', 'goroutines', 'mem_sys (MiB)', '每连接活跃'],
+    got.map(({ row, rep, after }) => {
+      const settled = rep.broker_settled ?? rep.broker_during ?? {};
+      return [
+        row.label,
+        comma(rep.planned_connections),
+        comma(rep.connected),
+        String(rep.connect_errors),
+        comma(settled.online),
+        `${comma(after?.connections_over_proxy_header)} / ${comma(after?.refused_over_proxy_header)}`,
+        comma(after?.refused_over_per_ip_connection_limit),
+        `${comma(after?.per_ip_gate_entries)} / ${comma(settled.per_ip_gate_held_sockets)}`,
+        comma(settled.goroutines),
+        mib(settled.mem_sys_bytes),
+        perConn(rep, settled, 'mem_alloc_bytes'),
       ];
     }),
   );
@@ -374,7 +533,14 @@ async function main() {
     console.log(`[${i + 1}/${rows.length}] ${row.label}`);
     let broker = null;
     try {
-      broker = await startBroker({ sync: row.sync, store, tls: row.tls });
+      broker = await startBroker({ sync: row.sync, store, tls: row.tls, extra: row.brokerArgs });
+      // Which limits are live for this row is part of the number, not a detail in
+      // the flags file — the broker says them out loud at startup, so echo that.
+      // Both announcements, when both are armed: a row measured with a cap and a
+      // header has two things live that change what the broker accepts.
+      for (const armed of [broker.log('per-address gate armed'), broker.log('transport header armed')]) {
+        if (armed) console.log(`    ${armed}`);
+      }
       const rep = await runLoader(row.loader, row);
       await sleep(1600); // outlast every flush interval, then read the settled numbers
       const after = await broker.metrics();
@@ -397,31 +563,100 @@ async function main() {
   const checked = got.filter((x) => x.rep && x.rep.mode === 'pump');
   const mismatched = checked.filter((x) => num(x.rep.delivered) !== num(x.after?.messages_out));
 
+  // A connection the gate turns away never reaches a CONNACK, so the loader counts
+  // it as an error too — the two sides have to agree here as well, in the other
+  // direction. Loader errors with no matching refusals on the broker means the
+  // sockets never got there: on Windows that is the ephemeral port range writing
+  // the row, and a table built from it would describe the client, not the gate.
+  // The transport header closes sockets the same way and for the same reason, so
+  // its counter belongs in the same sum.
+  const cappedRows = got.filter((x) => ['gate', 'proxy'].includes(x.row.group) && x.rep);
+  const refusedOf = (after) =>
+    num(after?.refused_over_per_ip_connection_limit) + num(after?.refused_over_per_ip_connect_rate) + num(after?.refused_over_proxy_header);
+  const unaccounted = cappedRows.filter(({ rep, after }) => num(rep.connect_errors) > 0 && refusedOf(after) < num(rep.connect_errors) * 0.95);
+
   // The probe measures the finest tick this machine showed during one run, and
   // Windows moves that resolution depending on who else holds a timer request, so
   // the rows can span an order of magnitude. One number in the header would make a
   // † cell look either stricter or looser than it is, so show the span.
   const grans = got.map((x) => num(x.rep?.clock_granularity_ns)).filter((n) => n > 0);
-  const granMin = Math.min(...grans) || 0;
-  const granMax = Math.max(...grans) || 0;
+  const granMin = grans.length ? Math.min(...grans) : 0;
+  const granMax = grans.length ? Math.max(...grans) : 0;
+  // A run of connection rows samples no round trip at all, so the tick it would
+  // have needed does not exist. Saying "0.00–0.00" would read as a measurement.
+  const tick = grans.length
+    ? `时钟粒度：${(granMin / 1e6).toFixed(2)}–${(granMax / 1e6).toFixed(2)} ms —— 本机 \`time.Now()\` 逐行实测的最小步进。
+单跳延迟低于一个 tick 就无法分辨，表里的 \`†\` 表示"比这一行自己的 tick 还短"，不是 0 ms。`
+    : '本次没有采样任何单跳延迟，因此没有时钟粒度可报（只有连接类行数）。';
   for (const g of GROUPS) {
     const subset = got.filter((x) => x.row.group === g && x.rep);
     if (!subset.length) continue;
-    const fn = g === 'conns' ? renderConns : g === 'fsync' ? renderFsync : renderPump;
+    const fn =
+      g === 'conns' ? renderConns : g === 'gate' ? renderGate : g === 'proxy' ? renderProxy : g === 'fsync' ? renderFsync : renderPump;
     sections.push(`### ${groupName[g]}\n\n${fn(subset)}\n`);
-    const errs = subset.filter((x) => x.error).map((x) => `- \`${x.row.label}\`: ${x.error}`);
+    const errs = subset
+      .filter((x) => x.error)
+      .map((x) => {
+        // A capped row whose connect errors the broker's own refusal counters
+        // explain is the feature working, not the run failing. Say which one it
+        // is: the note underneath reads like a broken dial, and it is not.
+        const refused = refusedOf(x.after);
+        const byTheGate = ['gate', 'proxy'].includes(x.row.group) && num(x.rep.connect_errors) > 0 && refused > 0 && !unaccounted.includes(x);
+        return (
+          `- \`${x.row.label}\`: ${x.error}` +
+          (byTheGate
+            ? `\n     ↑ 闸门或头部造成的，不是故障：broker 侧拒绝 ${refused.toLocaleString('en-US')} 条，压测端 ${x.rep.connect_errors} 条建连失败`
+            : '')
+        );
+      });
     if (errs.length) sections.push(`失败与告警：\n\n${errs.join('\n')}\n`);
   }
 
-  sections.push(
-    `### 仪表自检\n\n` +
-      `压测端的 \`delivered\` 对 broker 的 \`messages_out\`：${checked.length - mismatched.length}/${checked.length} 行相等。` +
-      (mismatched.length
-        ? `\n\n不等的那些行——至少一侧在数错东西，不要引用：\n\n` +
-          mismatched.map((x) => `- \`${x.row.label}\`: loader ${x.rep.delivered} vs broker ${x.after?.messages_out}`).join('\n')
-        : `两个计数器从套接口的两侧数同一批投递，相等才说明上面的表值得引用。`) +
-      `\n`,
-  );
+  const selfCheck = [
+    checked.length
+      ? `压测端的 \`delivered\` 对 broker 的 \`messages_out\`：${checked.length - mismatched.length}/${checked.length} 行相等。` +
+          (mismatched.length
+            ? `\n\n不等的那些行——至少一侧在数错东西，不要引用：\n\n` +
+              mismatched.map((x) => `- \`${x.row.label}\`: loader ${x.rep.delivered} vs broker ${x.after?.messages_out}`).join('\n')
+            : `两个计数器从套接口的两侧数同一批投递，相等才说明上面的表值得引用。`)
+      : `本次没有 pump 行，投递计数器的两侧对账不适用。`,
+  ];
+  if (cappedRows.length) {
+    selfCheck.push(
+      unaccounted.length
+        ? `\n\n压测端的 \`connect_errors\` 对 broker 的拒绝数（闸门 + 头部）：${cappedRows.length - unaccounted.length}/${cappedRows.length} 行对得上。` +
+            `下面这些行的失败不是闸门或头部造成的（broker 侧拒绝计数对不上），是压测端自己没拿到套接字——\n` +
+            `Windows 的动态端口范围和 TIME_WAIT 在连续几行上万建连后就会不够用。这些行不要引用：\n\n` +
+            unaccounted
+              .map((x) => `- \`${x.row.label}\`: loader 失败 ${x.rep.connect_errors} vs broker 拒绝 ${refusedOf(x.after).toLocaleString('en-US')}`)
+              .join('\n')
+        : `压测端的 \`connect_errors\` 对 broker 的拒绝数（闸门 + 头部）：${cappedRows.length}/${cappedRows.length} 行一致——` +
+            `被拒的连接不会变成会话，只会在这几个计数器上各留一笔，两边对上才证明表里的拒绝是闸门或头部做的。`,
+    );
+  }
+  // The header rows carry one more instrument, and it is the one that says the row
+  // measured what its label claims: a session held on a require-mode broker had to
+  // come in through a header, so those two counters must be equal — and on the
+  // control rows, which read no header at all, the header counter must stay zero.
+  const proxyRows = got.filter((x) => x.row.group === 'proxy' && x.rep);
+  if (proxyRows.length) {
+    const miscredited = proxyRows.filter((x) => {
+      const armed = (x.row.brokerArgs ?? []).includes('require') || (x.row.brokerArgs ?? []).includes('trusted');
+      return armed
+        ? num(x.after?.connections_over_proxy_header) !== num(x.rep.connected)
+        : num(x.after?.connections_over_proxy_header) !== 0;
+    });
+    selfCheck.push(
+      miscredited.length
+        ? `\n\n\`connections_over_proxy_header\` 对压测端 \`connected\`：${proxyRows.length - miscredited.length}/${proxyRows.length} 行一致，` +
+            `不等的那些行说明头部没有真的走过这条路径，不要引用：\n` +
+            miscredited.map((x) => `- \`${x.row.label}\`: 头部会话 ${x.after?.connections_over_proxy_header} vs 连上 ${x.rep.connected}`).join('\n')
+        : `\`connections_over_proxy_header\` 对压测端 \`connected\`：${proxyRows.length}/${proxyRows.length} 行一致——` +
+            `开了头部的那几行，每一条会话都被记成一次头部采信；\`off\` 那一行一个都没记，` +
+            `所以表里"这一行读的是什么"是 broker 自己说的，不是行标签说的。`,
+    );
+  }
+  sections.push(`### 仪表自检\n\n${selfCheck.join('\n')}\n`);
 
   const failures = got.filter((x) => !x.rep);
   const doc = `# 容量基线（实测）
@@ -431,8 +666,7 @@ async function main() {
 机器：${machine.platform} · ${machine.cpu} · 内存 ${machine.ram}
 Broker：\`${BIN}\` · 压测端：\`${LOADER}\`（同一台机器，loopback）
 每行时长：${SECONDS}s · 每行独立进程 + 独立 \`-store\` 目录
-时钟粒度：${(granMin / 1e6).toFixed(2)}–${(granMax / 1e6).toFixed(2)} ms —— 本机 \`time.Now()\` 逐行实测的最小步进。
-单跳延迟低于一个 tick 就无法分辨，表里的 \`†\` 表示"比这一行自己的 tick 还短"，不是 0 ms。
+${tick}
 
 > 这些数字是**同一台机器上的 loopback 下限**，不是 SLA。换机器、换网卡、换操作系统都要重跑
 > \`node load-baseline.mjs\`；压测端和服务端在同一台机器上会互相抢 CPU，所以真实部署通常更高。
@@ -447,6 +681,7 @@ ${JSON.stringify(
     label: row.label,
     sync: row.sync,
     loader: row.loader.join(' '),
+    broker_flags: (row.brokerArgs ?? []).join(' '),
     report: rep,
     broker_after: after && {
       online: after.online,
@@ -461,6 +696,16 @@ ${JSON.stringify(
       subscriptions: after.subscriptions,
       connections_tls: after.connections_tls,
       tls_handshake_failures: after.tls_handshake_failures,
+      refused_over_per_ip_connection_limit: after.refused_over_per_ip_connection_limit,
+      refused_over_per_ip_connect_rate: after.refused_over_per_ip_connect_rate,
+      per_ip_gate_entries: after.per_ip_gate_entries,
+      per_ip_gate_held_sockets: after.per_ip_gate_held_sockets,
+      refused_over_subscription_cap: after.refused_over_subscription_cap,
+      connections_over_proxy_header: after.connections_over_proxy_header,
+      refused_over_proxy_header: after.refused_over_proxy_header,
+      auth_rejected: after.auth_rejected,
+      auth_lockout_refusals: after.auth_lockout_refusals,
+      auth_locked_addresses: after.auth_locked_addresses,
     },
     state_log_bytes: state,
     error: row.error ?? '',
@@ -477,6 +722,7 @@ ${JSON.stringify(
   const notes = [];
   if (failures.length) notes.push(`${failures.length} row(s) failed`);
   if (mismatched.length) notes.push(`${mismatched.length} counter mismatch(es)`);
+  if (unaccounted.length) notes.push(`${unaccounted.length} gate row(s) whose errors never reached the broker`);
   console.log(`written   ${join('test', OUT)}${notes.length ? `  (${notes.join('; ')})` : ''}`);
   // A mismatch means the instrument is broken, and a broken instrument produces
   // tables that look fine. Fail the run rather than let one into a commit.

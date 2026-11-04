@@ -1,0 +1,25 @@
+# /etc/default/congmq —— congmq.service 里 EnvironmentFile 读的就是这个文件。
+#
+# 两条语法限制是 systemd 的，不是 broker 的：
+#   1) EnvironmentFile 不做变量展开，也没有"$CONGMQ_ARGS 再加一段"这种拼接——
+#      换形态要**整行替换** CONGMQ_ARGS 的值；
+#   2) 值按空白拆词，所以路径里不能有空格。
+# 改完 systemctl daemon-reload && systemctl restart congmq（改规则/证书不用 restart，见 §5）。
+
+# 生产最小集：落盘 + 规则 + 指标 + 报文上限。
+# 不带 -auth/-acl 就是"谁都能连、什么都能发"，那只能算试跑，别挂公网。
+CONGMQ_ARGS="-addr :1883 -id congmq-prod -store /var/lib/congmq -store-sync everysec -auth /etc/congmq/auth.jsonl -acl /etc/congmq/acl.jsonl -metrics 127.0.0.1:1884 -max-packet-size 1048576 -log-level info"
+
+# 前面有负载均衡（云 LB / nginx / haproxy）时改成这一行，来源地址才不再是 LB 自己：
+#   trusted = 只信 -trusted-proxy-cidr 里报的地址（直连设备照旧能用）；
+#   require = 每条连接都必须带合法头部（broker 只允许 LB 连进来）。
+#   选错的后果不一样：require 会把直连设备全拒掉，trusted 的网段写宽了则等于
+#   允许任何人冒充任意地址——那一段网络里只要能连上 1883，就能伪造来源 IP。
+#CONGMQ_ARGS="-addr :1883 -id congmq-prod -store /var/lib/congmq -auth /etc/congmq/auth.jsonl -acl /etc/congmq/acl.jsonl -metrics 127.0.0.1:1884 -proxy-protocol trusted -trusted-proxy-cidr 10.0.0.0/8 -proxy-header-timeout 3s"
+
+# mqtts：设备一台一台从明文迁过来时，明文与密文两个端口并跑（证书热换见 §5）。
+#CONGMQ_ARGS="-addr :1883 -tls-addr :8883 -tls-cert /etc/congmq/pki/server.crt -tls-key /etc/congmq/pki/server.key -tls-ca /etc/congmq/pki/ca.crt -store /var/lib/congmq -metrics 127.0.0.1:1884"
+
+# 接入层抗滥用（默认全 0 = 完全不计量）。整批设备共用一个 NAT 出口时先读 §4，
+# 不然它们会被判成"同一个人"，第一台之后全被拒。
+#CONGMQ_ARGS="-addr :1883 -store /var/lib/congmq -auth /etc/congmq/auth.jsonl -acl /etc/congmq/acl.jsonl -metrics 127.0.0.1:1884 -max-conns-per-ip 64 -conn-rate-per-ip 4 -auth-fail-limit 10 -auth-fail-window 1m"

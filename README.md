@@ -31,12 +31,16 @@ linux 的 amd64 / arm64 / armv7、windows amd64（zip）、darwin 的 amd64 / ar
 | 5.0 属性透传 | User Property、Content Type、Response Topic、Correlation Data、Payload Format 原样转发给订阅者 |
 | 认证 | JSONL 规则：md5/sha1/sha256/sha512 摘要、三种 salt 拼接方案、用户名/clientid 正则、来源 IP/CIDR；**客户端证书可就是凭据本身**（`cert_cn`） |
 | 授权 | JSONL 规则：按文件顺序 allow/deny、`%c %u %1..%9` 主题模板、无命中即拒绝 |
+| 接入层抗滥用 | 按来源地址限**并发连接**与**建连速率**（`-max-conns-per-ip` / `-conn-rate-per-ip`，判定在 accept）；凭据失败按地址锁定（拒绝而非 sleep，回的 CONNACK 与凭据错误不可分辨）；每会话 topic filter 条数上限（`-max-subs`）。**默认全部为 0 = 完全不计量**（§4） |
+| 真实来源地址 | PROXY protocol **v1 文本与 v2 二进制**头部（`-proxy-protocol` + `-trusted-proxy-cidr`），在计量与认证**之前**读，读完只剩 payload。于是网关、锁定、规则里的 `ip`、日志与存储里的 `RemoteIP` 判的都是设备本人，不是那台负载均衡（§4）。**默认 `off`：一个字节都不多读** |
 | 持久化 | 会话 + 保留消息 + 延迟遗嘱落盘，三档 fsync 策略，崩溃后重放；连接中的持久会话也留一条"订阅+身份"记录 |
+| 换二进制 | 记录格式 `congmq-store-v1` 自 v1.0.0 起字节未变，**跨版本双向接管**实测过（离线队列一条不缺、会话 `sessionPresent` 不用重订阅、遗嘱按原 deadline 准点）；`state.lock` 保证**一个 `-store` 目录只有一个写者**，第二个进程拒绝启动而不是静默覆盖（§6） |
 | 观测 | `-metrics` 同一份快照开三个口：`/metrics`（JSON，可直接 curl）、`/metrics.txt`（Prometheus 文本 0.0.4）、`/readyz`（就绪探针） |
 | 不停机运维 | 规则文件与服务端证书/CA **热加载**：`-reload-interval`（默认 2s，unix 上 SIGHUP 立刻查一次）；坏文件拒绝并保持旧策略，换证书不断已有会话 |
 | 关停 | SIGINT/SIGTERM 先关监听再 drain 会话，15s 上限 |
 | 内存护栏 | 报文长度在分配之前校验（`-max-packet-size`） |
-| 容量基线 | `cmd/congmq-load` + `test/load-baseline.mjs`：连接成本、QoS 吞吐、延迟分位、三档 fsync 代价，全是实测（§9） |
+| 容量基线 | `cmd/congmq-load` + `test/load-baseline.mjs`：连接成本、QoS 吞吐、延迟分位、三档 fsync 代价、闸门与传输头部的代价，全是实测（§9） |
+| 落地形态 | `Dockerfile`（多阶段、非 root、`/readyz` 健康检查）+ `deploy/docker-compose.yml`（nginx 发 PROXY 头 → broker `require`）+ `deploy/systemd/`（`ProtectSystem=strict`、`systemctl reload` 就是 SIGHUP）。CI 的 `docker` job 真的把这一套起来，再从负载均衡外面跑一次设备往返（§2、§8） |
 
 ### 没有（别踩坑）
 
@@ -44,8 +48,22 @@ linux 的 amd64 / arm64 / armv7、windows amd64（zip）、darwin 的 amd64 / ar
   换完**不用重启**（写回原路径，一个轮询周期内生效，见 §2 与 §11），但 broker 不会自己去申请或续签。
   过期/未生效的叶子在启动期和重载时**同样被拒**，所以别指望热加载能救一张已经过期的证书。
 - **明文端口不会升级成 TLS**（没有 STARTTLS）。要么连 `-addr`，要么连 `-tls-addr`，两个端口各管各的。
+- **单写者闸门只在新版本里**。`state.lock` 挡住的是"两个都认得这道闸的进程"，v1.0.0 没有这段代码，
+  你用它去开一个当前版本正占着的目录，它照起并照盖（§6 实测）。所以回滚方向仍然靠流程：
+  先确认旧进程退干净，再起下一个。同理，闸门是**文件句柄**级别的：把目录拷到另一台机器，那份
+  `state.lock` 不带任何含义；两台机器挂同一个共享目录时它能不能拦住，取决于那个挂载怎么实现文件锁——
+  这一点没实测过，别把它当成集群保护（本项目本来就是单节点，见 §11）。
 - **`cert_cn` 规则管不到离线队列**。设备掉线后存储身份没有证书可查，按证书授权的主题会在**入队之前**
   被拒（`acl_denied_delivery`），回来也补不上——见 §5 第 3 条。
+- **抗滥用那一层认的是地址，不是账号**。一个 NAT 出口或一段 IPv6 /64 里的整批设备，在
+  `-max-conns-per-ip` / `-conn-rate-per-ip` / `-auth-fail-limit` 眼里就是同一个"人"（§4 与 §11）——
+  所以它们默认全是 0，开了之前先确认你的机队不是一个 IP。要按身份限，只有 `-max-conns`、
+  `-max-subs` 和规则文件里的 `clientid` / `ip` 这三样。**如果那个"一个 IP"其实是一台负载均衡**，
+  让它把真实地址写在连接最前面（`-proxy-protocol`，§4），这句话就不再成立；NAT 出口仍然成立。
+- **头部里那个地址是前置说出来的，不是被证明的**。PROXY protocol 没有签名也没有加密，
+  谁能连上这个端口，谁就能报任意来源地址——所以 `-trusted-proxy-cidr` 写宽了等于把
+  "按地址做的所有判定"交给那段网络里最不受约束的人。要么 `require`（只有前置进得来），
+  要么把网段收到只有前置那一台。§11 记了这个取舍。
 - **没有 WebSocket / MQTT-SN**，只有 TCP。
 - **单机**：无集群、无共享订阅跨节点、无保留消息同步。
 - **不发布 `$SYS/#`**。broker 不产生任何内部状态主题，监控走 `/metrics`。
@@ -136,6 +154,42 @@ level=ERROR msg="tls material refused, still serving the certificate already in 
 `tls_cert_reload_failures` 加一（同一份坏内容只记一次，不是每个周期记一次）。语义与四条边界见 §5，
 证书那一半见 §11。
 
+### 用容器或 systemd 落地
+
+两条路都在仓库里，都不是"参考配置"：`Dockerfile` 与 `deploy/` 是 CI 每个 PR 真起一遍的东西
+（`docker compose up` + nginx + 从负载均衡外面打一条设备消息进去，见 §8 的 `docker` job）。
+
+```bash
+# 容器：build + 起来，设备口在 127.0.0.1:1883（先过 nginx），指标口在 127.0.0.1:8080
+docker compose -f deploy/docker-compose.yml up -d --build
+node test/lb-smoke.mjs                    # 设备真的从负载均衡后面连上来，并且被记成一条头部连接
+curl -s localhost:8080/metrics | jq '.connections_over_proxy_header, .refused_over_proxy_header'
+
+# systemd：从 Releases 的归档装（归档里就带 deploy/systemd/）
+sudo useradd --system --home-dir /var/lib/congmq --no-create-home --shell /usr/sbin/nologin congmq
+sudo install -m 0755 congmq /usr/local/bin/congmq
+sudo cp deploy/systemd/congmq.default /etc/default/congmq
+sudo cp deploy/systemd/congmq.service /etc/systemd/system/ && sudo systemctl daemon-reload
+sudo systemctl enable --now congmq
+sudo systemctl reload congmq              # 就是发一个 SIGHUP：立刻重查规则与证书，不重启、不断会话
+```
+
+四件事要说在前面：
+
+- **裸 `docker run` 是一个开放的 broker**。镜像的默认命令只有 `-addr :1883 -metrics :8080 -store ...`，
+  既没有 `-auth` 也没有 `-acl`，那按 §4 的语义就是"任何人可连 + 全部放行"。规则是部署处的数据、
+  不是镜像里的内容，所以要么挂 `/etc/congmq` 并覆盖 `command:`（compose 那份就是这么写的），
+  要么就别把这条端口发布出去。同理，默认命令也没给 `-max-packet-size`。
+- **不发镜像仓库**。`deploy/docker-compose.yml` 里 `image: congmq:local` 配的是 `build:`，
+  也就是从这份 checkout 本机构建；没有 `ghcr.io/...` 之类的公开 tag 可拉。要用现成镜像就自己
+  推到你们的私有仓库，或按上面第一行在目标机上 build。
+- **TLS 证书不在镜像里**。镜像只带二进制；`-tls-cert/-tls-key/-tls-ca` 走挂载或 systemd 的
+  `/etc/congmq/pki`。`cmd/congmq-cert` 造的是测试链，别拿到公网（§1）。
+- **容器里的来源地址**。compose 那套把 broker 放在只有 nginx 进得来的网络上，所以用
+  `-proxy-protocol require`；如果你还要留一条直连口给还没迁的设备，改用 `trusted` 并把
+  `-trusted-proxy-cidr` 收到 nginx 那一段（§4）。两种形态下 `docker exec` 进去都看不到设备真实 IP
+  ——那是网络 namespace 的事，不是 broker 的事。
+
 ---
 
 ## 3. 目录结构
@@ -148,9 +202,12 @@ internal/packets/  报文编解码（3.1.1 + 5.0 属性层），纯协议无状�
 internal/topics/   主题过滤器 trie 树 + 通配符匹配 + $share 轮转
 internal/store/    会话存储：MemoryStore / FileStore（追加式日志 + compaction）
 internal/rules/    auth.jsonl / acl.jsonl 的严格加载与求值
+internal/proxyproto/ 只读 transport header：PROXY protocol v1 文本与 v2 二进制，按字节判定、按长度消费
 internal/tlscert/  证书链构造，只被 cmd/congmq-cert 用
-internal/broker/   内核：连接状态机、QoS 1/2、离线队列、保留消息、遗嘱、TLS 监听、恢复、规则原子快照
+internal/broker/   内核：连接状态机、QoS 1/2、离线队列、保留消息、遗嘱、TLS 监听、恢复、规则原子快照、来源地址包装
 rules/             可直接使用的示例规则文件（注释即文档）
+Dockerfile         多阶段、CGO_ENABLED=0、非 root、/readyz 健康检查
+deploy/            落地形态：docker-compose.yml + nginx（发 PROXY 头）+ systemd unit 与 /etc/default
 test/              Node 工具层：用 mqtt.js 这个第三方客户端做一致性验证，并留存 §9 那几张表的运行原件
 ```
 
@@ -169,10 +226,77 @@ test/              Node 工具层：用 mqtt.js 这个第三方客户端做一�
 | --- | --- | --- |
 | `-addr` | `:1883` | 明文 TCP 监听地址。要加密请另开 `-tls-addr`；两者可以同时跑，也可以只开 TLS 那个 |
 | `-id` | `congmq-1` | 日志与 `/metrics` 里的 broker 标识 |
-| `-max-conns` | `0`（不限） | 连接上限。稳态实测每条连接 28 KiB 活跃 / 56 KiB 预留（§9），最坏内存由 `-max-packet-size` 决定（§10 第 1 条） |
+| `-max-conns` | `0`（不限） | 连接上限。稳态实测每条连接 28 KiB 活跃 / 56 KiB 预留（§9），最坏内存由 `-max-packet-size` 决定（§10 第 1 条）。按来源地址的那几个上限见下面「接入层抗滥用」 |
 | `-mailbox-size` | `256` | 每条连接在路由与连接协程之间的交接队列深度 |
 | `-write-timeout` | `10s` | 单次 socket 写入的截止；超时就认为对端卡死 |
 | `-deliver-timeout` | `5s` | 一个慢订阅者最多能拖住发布者多久，超时则断开它（先落盘再断） |
+
+### 接入层抗滥用（默认全部关闭）
+
+| 参数 | 默认 | 说明 |
+| --- | --- | --- |
+| `-max-conns-per-ip` | `0`（不限） | 同一来源地址**同时**可持有的连接数，在 accept 处判定 |
+| `-conn-rate-per-ip` | `0`（不计量） | 同一来源地址每秒可新建的连接数。令牌桶，可用小数：`0.2` = 五秒一个 |
+| `-conn-burst-per-ip` | `0`（一秒的量，下限 1） | 桶容量，即安静之后可以一次性发起多少连接。单独给会 `exit 2`——它是 `-conn-rate-per-ip` 的窗口大小，不是独立的限流 |
+| `-auth-fail-limit` / `-auth-fail-window` | `0`（不退避） | 一个窗口内同一地址允许的凭据失败次数，达到就把这个地址锁起来。两个必须成对给，而且必须有 `-auth`，否则 `exit 2` |
+| `-auth-lockout` | `0`（= 一个完整窗口） | 锁定时长。锁定期内**再多的失败不会延长它** |
+| `-max-subs` | `0`（不限） | 单个客户端可同时持有的**不同** topic filter 条数。这条按会话算、不按地址算，判定在 SUBSCRIBE（语义见下） |
+
+判定都在这条慢路径上——连接类的在 accept、凭据锁定在 CONNECT、订阅上限在 SUBSCRIBE——
+发布与投递的热路径没有为它们改过一行（§9 那组 off / armed 对照就是把这件事称出来的）。
+地址的键：IPv4 精确、IPv6 取 /64 前缀、`::ffff:a.b.c.d` 折回 IPv4；取不到 IP 的连接共用一个桶。
+
+**为什么限流点在 accept 而不是 CONNECT**：CONNECT 处设限只能管住"会话"，而一个只建 TCP、
+一个字节都不发的对端永远走不到 CONNECT——它还占着一个 socket、一个读截止和三个协程，
+一直到 30s 的 pre-connect 截止（`preConnectTimeout`，写死在 `internal/broker/client.go:24`）才释放。
+只有计量 socket 本身才看得见这种负载。
+
+**这几项都会咬错人，默认才全是 0**：一个 NAT 后面的 200 台设备，在 broker 眼里就是同一个 IP；
+一个共享出口的办公网同理。代价与放大半径写在 §11，怎么选值写在 §10 第 2 条。
+
+**锁定的代价，写明白**：锁定期内这个地址**连对了密码也会被拒**，而且回的 CONNACK 和凭据错误
+一模一样（`0x04`）——锁定不该成为一条"这里有账号"的泄露。失败计数在锁定期内不再累加，
+一次成功登录会把计数清零（但买不通一个正在生效的锁定）。计数看
+`auth_lockout_refusals`，当下有没有人在坐看 `auth_locked_addresses`（§7）。
+
+订阅上限刻意按**不同 filter 条数**算，而不是按 SUBSCRIBE 次数：已经持有的 filter 重新订阅
+永远允许（否则一台占满额度的设备再也改不了自己主题表的 QoS），UNSUBSCRIBE 自己腾额度，
+重连恢复的会话**绕过**上限——把 `-max-subs` 调低不该让一批已经在服役的设备失联。
+上限在 ACL 之后判定：一个两样都不合格的订阅，先告诉它"这个你不能订"。
+3.1.1 回 `0x80`，5.0 回 `0x97`（Quota Exceeded）。
+
+### 真实来源地址（PROXY 协议，默认关闭）
+
+| 参数 | 默认 | 说明 |
+| --- | --- | --- |
+| `-proxy-protocol` | `off` | `off` 不读头部；`require` 要求每条连接都以合法头部开头（专职监听口，只允许前置访问）；`trusted` 只相信 `-trusted-proxy-cidr` 里那些地址报出来的头部 |
+| `-trusted-proxy-cidr` | `""` | 允许"替别人报地址"的网段，逗号分隔，如 `10.0.0.0/8,fd00::/8`。`trusted` 不给等于谁都别想报——所以直接 `exit 2`；`require` 给了也 `exit 2`，那条路径根本不查表 |
+| `-proxy-header-timeout` | `5s` | 对端把头部写完的预算。必须为正：`0` 不是一个"不限"的写法，而是一个已经过去的截止，会在头部读完之前掐掉每一条连接，所以 `exit 2` |
+
+`-proxy-protocol off` 时，`-trusted-proxy-cidr` 与 `-proxy-header-timeout` 只要被显式给出就 `exit 2`，
+并把"这几个不会生效"列在报错里——比没设更糟的是设了并相信它生效了。
+
+两种头部都读：v1 文本（`PROXY TCP4 src dst sport dport`）与 v2 二进制（12 字节签名 +
+`ver_cmd` / `fam_trans` + 16 位长度 + 地址块），IPv4 与 IPv6 都支持，v2 尾部 TLV 按长度跳过。
+尺寸按规范封顶（文本 108 字节，二进制 16 + 自己声明的长度），**超限是致命错误而不是"这不算头部"**：
+一个自称 4000 字节的头部不是"大一点的头部"，是有人在拿它当隧道。`LOCAL`（前置自己的健康检查）是合法且
+"没有报别人"，于是放行并用 socket 自己的地址——探针不该被算成一次会话。
+
+`trusted` 的两种错位都刻意做得不舒服，因为含糊的那一侧正是故障藏身处：
+一个名单里的地址**没发**头部会被拒（名单说了它会发，没发说明站在那儿的不是那个前置）；
+一个名单外的地址**发了**头部也会被拒，而不是"忽略掉继续当直连"——
+写一个明知不会被相信的头部，唯一的动机是试探它会不会被相信。
+
+打开之后真实地址走的是 `RemoteAddr()`，所以下游一行都没改就一起对了：接入闸门的按地址限流、
+auth 规则里的 `ip`、ACL 里的 `ip`、凭据锁定的键、离线会话存下来的来源地址、以及日志。
+日志的字段换成了一对：`remote` 是**做决定时依据的那个地址**，`via` 是连接真正落进来的 socket——
+"闸门为什么把我一整批设备关在外面"只有把两个地址放在一起才答得出来。TLS 端口同样生效，
+且头部在握手之前读，所以前置可以做四层透传（`deploy/nginx/nginx.conf` 就是这么配的）。
+
+代价：`off` 是零（不读、不缓冲、不开协程，走的是另一条代码路径）；armed 时每条连接多一条短命协程
+和一份**常驻到连接结束**的包装 + 128 字节缓冲——解析完那个 reader 不丢，后面的报文解码就从它里面读。
+协程开在外面是因为读头部是对端的日程表：一个连上就沉默的对端不该让 accept 循环等满五秒。
+实测数字见 §9「传输头部的代价（PROXY protocol）」。
 
 ### 传输安全（TLS / mTLS）
 
@@ -251,8 +375,14 @@ test/              Node 工具层：用 mqtt.js 这个第三方客户端做一�
   （`username+salt` / `salt+username` / `salt+username+salt`）决定。
 - `sanitize`（默认 true）指摘要前把用户名里非 `[A-Za-z0-9]` 的字符去掉；正则匹配作用于**原始**用户名。
 - `username` / `clientid` 省略即匹配任意，`"match":"regex"` 走 POSIX 扩展正则，`ip` 支持单 IP 或 CIDR。
+  开了 `-proxy-protocol`（§4）之后，这里比的是**头部里那个设备地址**而不是负载均衡——这条规则在两种
+  形态下的语义是一样的，变的只是 broker 眼里"对端"是谁。
 - 命中顺序：字面用户名（或字面 `cert_cn`，见下）的规则优先，然后按文件顺序尝试正则/`*` 规则；
   同一条规则内 `clientid`、`ip`、`cert_cn` 是 AND 约束。全部试完仍不匹配 → 拒绝。
+- 开了 `-auth-fail-limit`（§4）之后，锁定判定在**规则匹配之前**：一个正在坐锁定的地址，
+  broker 连"这条规则有没有命中"都不会去答。计数记的是"规则没命中"这件事本身，**不分原因**——
+  密码错、证书 CN 对不上、明文连接撞上 `cert_cn` 规则，都算一次。所以一批配置错的设备
+  挤在同一个 NAT 出口后面时，是这整个出口一起被锁；这正是它默认关闭的原因之一。
 
 ### 证书就是凭据（mTLS）
 
@@ -375,12 +505,66 @@ load——所以不存在"新 ACL 配旧凭据校验器"这种没人写进文件
 ### 干净关停
 
 `Close()` 会先把待写快照刷完，再把整个文件按当前活状态重写一遍（compaction），
-所以正常退出的日志永远是紧凑的。追加量超过 `-store-compact-mb` 时运行中也会重写一次。
+所以正常退出的日志永远是紧凑的。追加量超过 `-store-compact-mb` 时运行中也会重写一次
+（由后台写盘的那个 tick 判断，所以最迟一个 `-store-flush-interval` 之后就发生）。
+
+这条决定的是磁盘的**上界**，值得单独记一句：会话是整份快照追加的，一个压着几千条消息的
+离线会话每被更新一次，就往文件里再写一遍它自己的全部队列。所以运行中的文件大小 ≈
+"存储还留着的东西 + 自上次重写以来的追加量"，前者看 `store_sessions` / `store_queued`，
+后者看 `store_bytes` 与那个阈值。
+
+**注意它不会跟着负载一起掉回去**：设备取完、会话过期回收之后，文件仍留着上一次重写那一刻
+的体积——那一刻存的是洪峰的驻留，不是空的存储。要等追加量再过一遍阈值（或干净关停时的那次
+重写）它才掉下来。所以按**峰值驻留**规划磁盘，不是按稳态：浸泡实测过一轮，
+`store_sessions` / `store_queued` 都归零之后 `state.log` 仍是洪峰大小，而每个数都对得上。
+反过来，如果它一路只涨、连阈值都过不了，就是压缩没跑到（看 `store_bytes` 与文件实际大小的差，
+两者应当一致）。
 重写走"临时文件 → fsync → 关闭活句柄 → rename → 重开"，Windows 不允许 rename 覆盖打开中的文件，
 因此顺序不能换。
 
 `os.Exit` 会跳过 defer，所以每个退出路径都显式关一次 store；漏掉这一步的代价是
 "你以为已经落盘的那条消息"。
+
+### 换二进制：升级与回滚
+
+`-store` 目录里现在有两个文件：`state.log`，和 `state.lock`。后者一个字节都不写，只是被持有
+（`internal/store/lock.go:27`）——它是"这个目录只有一个写者"的闸门。**别删它**：删掉等于把闸门拆了，
+下一个进程会在一个新文件上取到锁，两个写者照旧撞在一起。
+
+这道闸门是实测逼出来的。把一个目录同时交给两个进程（升级时"先起新的、再停旧的"就会这样），
+两边各自 seek 到当时的文件末尾再追加，于是后写的那个把对方的记录**盖在同一个偏移上**。
+而每条记录的长度和 CRC 都是自己那一份，全都对得上，所以重放看不出任何异常：实测那份文件里
+47 条记录全部可信、启动日志零告警、`store open` 平静地报 `sessions=1`，
+而 60 条已经 PUBACK 的离线消息里有 20 条永远不见了。这种丢失没有"检测到就降级"可言，
+只能在打开的那一刻拒绝：第二个进程 `exit 1`，并说清是哪个目录被别人占着。
+
+锁属于**文件句柄**，进程一死操作系统就替它放开，所以被 kill -9 的 broker 不会把后继者关在门外
+（`npm run rolling-upgrade` 第三条腿量的就是这个）。它也不跨机器：`state.lock` 被 tar、被 rsync、
+被备份走都不带任何含义。唯一还挡不住的是**旧版本**——v1.0.0 里没有这段代码，用它去开一个新版本
+正占着的目录，它照起（同一条腿实测："STARTED anyway"）。所以回滚方向仍然要靠流程：
+先确认旧进程真的退干净（`systemctl stop` 返回 0、`docker compose up -d` 走的是替换而不是并存），
+再起下一个。
+
+格式那一侧可以放心，两个方向都实测过：`congmq-store-v1` 的编解码（`internal/store/record.go`）
+从 v1.0.0 到现在是**零字节差异**，新增的全是方法，记录结构没动过。
+
+| 方向 | 离线队列 | 在线会话接管 | 保留消息 | 延迟遗嘱 |
+| --- | --- | --- | --- | --- |
+| v1.0.0 → 当前 | 98 条跨版本，一条不缺、顺序不变、零重复 | `sessionPresent=true`，客户端没重订阅照样收 | 照旧带 RETAIN 到达 | 15.0s 准点，且只发一次 |
+| 当前 → v1.0.0 | 101 条跨版本，同上 | 同上 | 同上 | 同上 |
+
+命令行兼容性是单向的，但方向站在使用者这边：新版本只**新增**开关（`-max-subs`、
+`-conn-rate-per-ip`、`-proxy-protocol` 这类，共 10 个），没有改名也没有删除，
+所以 v1.0.0 那条 systemd / compose 命令行原样能起新版本。反过来把只属于新开关的命令行喂给
+旧二进制，会在 flag 解析阶段就退出——那也是拒绝，不是半起。
+
+升级那一刻丢什么，两条路要分开算。**离线队列不丢**：凡是给过 PUBACK 的，都按写入顺序回来
+（`-store-sync always`，上表两向都是零缺零重）。**在线投递是内存转手**：路由器把消息交给订阅者的
+mailbox 就算数，它不落盘，所以 kill 会带走"那一刻还没写到 socket 上的那几条"，上界就是
+`-mailbox-size`（默认 256）的量级；实测在 16 条/秒的持续负载下两个方向都是 0 条
+（66 / 68 个跨版本 ack 一个不丢）。QoS 2 半程（PUBREC 已收、PUBREL 未到）与未确认在途的
+跨版本恢复，第三方客户端证明不了——它收到就 ack——那两半由 `internal/broker/restart_test.go`
+的裸 socket 客户端钉住。
 
 ---
 
@@ -398,13 +582,21 @@ load——所以不存在"新 ACL 配旧凭据校验器"这种没人写进文件
 | --- | --- |
 | `id` `online` `total_connections` `subscriptions` `retained_messages` | 瞬时状态 |
 | `messages_in` `messages_out` `bytes_in` `bytes_out` | 累计流量 |
-| `queue_spills` | 离线队列超过 `-queue-max` 被裁剪的次数（每次裁剪同时计入 `dropped_messages`，持续增长说明订阅者回来得太慢或队列给小了） |
+| `queue_spills` | **累计**：路由给"当前不在线的订阅者"、真的写进离线队列的消息条数。它和 `dropped_messages` 是一对——这个在涨、那个不涨，说明设备确实回来取、队列也确实接得住；**两个都不涨**说明这一路上根本没有离线投递，`-queue-max` 给多大都无所谓。早期版本这里记的是"队列被裁剪的次数"，那个语义和 `dropped_messages` 重复，而且让一个正常服务的 broker 看起来什么都没做 |
 | `dropped_messages` | 被丢弃的消息（离线队列超限、慢消费者等） |
+| `store_sessions` `store_queued` | 存储眼下留了多少个会话、这些会话里压了多少条待投消息。离线队列就是内存的主要去向，所以**负载结束后 `mem_alloc_bytes` 不降，先看这两个数**：都归零而 heap 仍高，那是 GC 的时机问题；还有数，就是有设备没回来、或回收器没跑完。注意在线会话也有记录（§6 的"崩溃不失联"），所以 `online` 不为 0 时这里本来就该大于 `online` |
+| `store_bytes` | `state.log` 此刻的字节数，没开 `-store` 就是 0。配合 §6 那条压缩承诺读：文件 = 存储还留着的东西 + 自上次重写以来的追加量，所以它长期只涨不缩就是压缩没跟上，旋钮是 `-store-compact-mb` |
 | `expired_messages` `expired_sessions` | 5.0 Message Expiry / Session Expiry 回收量 |
 | `malformed_packets` `protocol_errors` `rejected_connections` | 非法输入；突增通常是有人在扫描或客户端实现有问题 |
 | `dropped_over_peer_max_packet_size` | 因对端自己声明的 Maximum Packet Size 而未发出的消息 |
 | `server_disconnects` | broker 主动断开的次数（慢消费者、超时限、关停） |
 | `auth_rejected` `acl_denied_publish` `acl_denied_subscribe` `acl_denied_delivery` | 安全拒绝计数，规则收紧时盯这四条 |
+| `refused_over_per_ip_connection_limit` `refused_over_per_ip_connect_rate` | 被 `-max-conns-per-ip` / `-conn-rate-per-ip` 在 accept 处直接挂断的 socket 数。它们**从未变成会话、从未被读过一个字节**，对端也收不到任何解释——所以除了这两个数，没有任何地方记录过那场建连风暴。只在闸门开着时才动 |
+| `per_ip_gate_entries` `per_ip_gate_held_sockets` | 闸门眼下记了多少个地址 / 这些地址手上还握着多少 socket。前者是表的大小（空闲十分钟回收，一张长满的表本身就是信号），后者是"离上限还有多远"——值得预警的那个值。闸门关着时恒为 0 |
+| `auth_lockout_refusals` `auth_locked_addresses` | 因地址正在坐锁定而被拒的 CONNECT 次数（累计）/ 当下有几个地址在锁定里。`auth_rejected` 先涨、`auth_lockout_refusals` 接着涨 = 爆破正在被挡；两个都不涨而设备喊"密码不对" = 有人在改规则文件 |
+| `refused_over_subscription_cap` | 因达到 `-max-subs` 而被拒的 SUBSCRIBE **条数**（累计）。突然开涨是两件事之一：客户端每次重连都在往上叠订阅表，或者这个上限设得比机队实际需要的小 |
+| `connections_over_proxy_header` | **累计**：靠头部里的来源地址建立起来的会话数（§4「真实来源地址」）。它只统计"确实信了一个头部"，所以 `require` 口的这个数应当贴着 `total_connections` 走（`LOCAL` 探针那一类不涨它，那是有意的）；明显低于它就是有连接在用直连的方式撞这个口 |
+| `refused_over_proxy_header` | **累计**：在头部这一步就被挂断、从未成为会话的 socket 数。它和 `refused_over_per_ip_*` 一样，对端收不到任何解释、日志也被节流（每 100 次一行），所以**这是唯一的记录**。涨了通常是三件事之一：有人直连了只该前置能碰的端口、前置的头部配置没打开、或者有人在试探"写个假地址会不会被信"——第三种要去看 `via` 是谁 |
 | `connections_tls` `tls_handshake_failures` | 都是**累计**值，且已经含在 `total_connections` 里。前者 = 握手成功并变成会话的连接数；后者 = **从未变成会话**的握手（明文打到 TLS 端口、证书链/域名不被信任、客户端没交证书、握手超时）。**`tls_handshake_failures` 涨而 `connections_tls` 平**就是有人在敲 TLS 端口却进不来，通常是证书过期或 SAN 少了那个名字 |
 | `acl_unsafe_expansions` | 展开出的身份含通配符，规则被跳过（见 §5）。**跨重载单调**：被丢弃那一半的计数会折进新一代，不会因为换了规则就归零 |
 | `rules_generation` `rules_loaded_unix` | 当前生效的是第几代策略、它什么时候生效的。改完文件先来看这个数有没有加一，再去猜连接为什么变了 |
@@ -412,7 +604,7 @@ load——所以不存在"新 ACL 配旧凭据校验器"这种没人写进文件
 | `reload_interval_seconds` | `-reload-interval` 的秒数，`0` 表示只认 SIGHUP（Windows 上等于不热加载） |
 | `tls_cert_generation` `tls_cert_reloads` `tls_cert_reload_failures` | 证书侧同样的三个数 |
 | `tls_cert_cn` `tls_cert_not_after_unix` | 现在被服务的这张叶子是谁、什么时候到期。**到期告警钉在后者**：broker 只在文件变化时重新校验，一张正在服役的证书过期它自己不会发现 |
-| `goroutines` `mem_alloc_bytes` `mem_sys_bytes` `heap_objects` `gc_cycles` | 进程自身开销：`mem_alloc` 是活对象占用，`mem_sys` 是 Go 向 OS 拿走的总量（含还没还给内核的部分）；容量核算用后者，泄漏排查看前者增速 |
+| `goroutines` `mem_alloc_bytes` `mem_sys_bytes` `heap_objects` `gc_cycles` | 进程自身开销。**`mem_alloc` 是上一次 GC 那一刻的活对象快照，不是实时值**：空载的 Go runtime 可以几分钟不回收，于是它会一直停在负载期间的大小（`gc_cycles` 不动就是证据）。所以容量核算用 `mem_sys`（Go 向 OS 拿走的总量，含还没还给内核的部分），泄漏排查比**同等负载谷底之间**的 `mem_alloc` 增速，别看收尾那一眼 |
 | `pid` `uptime_seconds` `num_cpu` | 谁在跑、跑了多久、能用几个核——多实例部署时靠 `pid` 把指标和进程对上 |
 
 最有用的告警组合：`dropped_messages` 增速、`server_disconnects` 增速、`online` 绝对值，
@@ -424,6 +616,20 @@ load——所以不存在"新 ACL 配旧凭据校验器"这种没人写进文件
 - **`tls_cert_not_after_unix` 距今不足 7/30 天** —— broker 只在证书*文件变化*时才重新校验有效期，
   换文件才是续期，没人换就没人管。轮换成时它自己会打 `WARN the tls certificate expires soon`，
   但那行日志只在**轮换那一刻**出现，所以别把日志当告警用。
+
+抗滥用那一层（§4）另加两条，共同点是**它们不说明系统坏了，只说明有人在按它**：
+
+- **`per_ip_gate_held_sockets` 贴近 `-max-conns-per-ip`** —— 快咬人了。先确认是不是一个 NAT 出口
+  在替一整批设备共用一个 IP（那就是设错了值，不是攻击），再谈限速。
+- **`auth_lockout_refusals` 开始增长** —— 一个地址坐进了锁定。日志里那一行带 `failures` 和
+  `locked_for`，值得看一眼是谁；同时 `refused_over_subscription_cap` 单独增长是另一回事，
+  它几乎总是客户端行为或 `-max-subs` 设小了。
+
+开了传输头部（§4）再加一条，它和前两条的区别是**它一定意味着有人在动网络**：
+
+- **`refused_over_proxy_header` 从 0 变成非 0** —— 三种可能，按危险程度排：名单外的地址在写头部
+  （`via` 字段告诉你是谁）、前置在往 `require` 口上发直连流量（配置漏了一层）、
+  或前置发的头部格式我们读不了。第二种最容易被误读成"设备连不上"，因为它的现象就是间歇性挂断。
 
 ---
 
@@ -438,7 +644,7 @@ go test ./...
 gofmt -l . && go vet ./...
 ```
 
-Node 层要在 `test/` 里跑，它按脚本要求连接特定端口和特定参数的 broker（`npm run` 已把这七个登记成脚本）。
+Node 层要在 `test/` 里跑，它按脚本要求连接特定端口和特定参数的 broker（`npm run` 已把这十个登记成脚本）。
 下面都在仓库根目录执行：
 
 ```bash
@@ -472,31 +678,108 @@ Node 层要在 `test/` 里跑，它按脚本要求连接特定端口和特定参
 # 崩溃恢复：自己起进程、自己 SIGKILL、自己重启，不需要你先准备 broker
 (cd test && node crash-check.mjs)
 
+# 冷备份 → 恢复演练：按运维的做法把目录拷出去（另一条路径、另一个 -id），用**拷贝**起另一个
+# broker，问第三方客户端离线队列 / 保留消息 / 延迟遗嘱还在不在。第二条腿拷的是"备份时还在写"
+# 的文件并从中途截断——它必须大声降级（报 bytes_discarded、砍到最后一条可信记录）而不是静默少东西。
+# 第三条腿比三档 fsync 起回来的东西一样不一样。端口 1985–1990，CONGMQ_DRILL_BASE_PORT 可换
+(cd test && npm run restore-drill)
+
+# 跨版本滚动升级：从 v1.0.0 那个 tag 单独编一个二进制，和当前构建跑**同一个 -store 目录、同一个
+# 端口**，中间流量不断，两个方向各做一次接管；第三条腿量的是"新进程先起来"那个升级时的手误——
+# 现在它被拒绝启动（见 §6）。需要两个二进制：
+#   go build -o .tmp/congmq.exe ./cmd/congmq
+#   mkdir -p .tmp/v1000 && git archive v1.0.0 | tar -x -C .tmp/v1000
+#   (cd .tmp/v1000 && go build -o ../congmq-v1000.exe ./cmd/congmq)
+# 端口 1941–1948，CONGMQ_UPGRADE_BASE_PORT 可换；默认从 ../bin 与 ../.tmp 取二进制，
+# 也可以用 CONGMQ_BIN / CONGMQ_OLD_BIN 指过去
+(cd test && npm run rolling-upgrade)
+
+# 抗滥用：起四个 broker（全关 / 只限并发 / 只限速率 / 锁定 + 订阅上限），用 mqtt.js 和一个
+# 一个字节都不发的裸 socket 从外面看它们的裁决，再回到 /metrics 与 /metrics.txt 对账。
+# 端口 1920–1927，CONGMQ_ABUSE_BASE_PORT 可以换一块
+(cd test && npm run abuse-check)
+
+# 真实来源地址：起四个 broker（头部关闭 / require / trusted + 名单 / require + 每地址上限），
+# 在本进程里起一个迷你四层前置，按规范逐字节写 v1 文本与 v2 二进制头部，再用 mqtt.js 打过去。
+# 它验的是"跨语言的字节是不是我们以为的那些字节"——Go 侧的测试和解析器共用一个字节序，
+# 只有外面写的一方才能证明这些字节真的来自一个负载均衡器。
+# 端口 1930–1937，CONGMQ_PROXY_BASE_PORT 可以换一块
+(cd test && npm run proxy-check)
+
+# 互操作矩阵：不用自己写的客户端，用 Eclipse 官方的 paho.mqtt.python 打全路径——3.1.1 与 5.0、
+# QoS 0/1/2、retained、遗嘱与遗嘱间隔、共享订阅、主题别名、用户属性、错误口令、会话接管，
+# 逐条对 reason code。它要一个装了 paho-mqtt 的 python：
+#   python -m venv .tmp/venv-paho && .tmp/venv-paho/Scripts/pip install paho-mqtt==2.1.0
+# （也可以 PAHO_PYTHON 指到别的解释器）。端口 1950–1963，CONGMQ_INTEROP_BASE_PORT 可换
+(cd test && npm run interop)
+
+# 浸泡：四类负载轮换 + 会话 churn，判据是**同等负载谷底之间的堆斜率**，不是收尾那一眼
+# （HeapAlloc 是上一次 GC 那一刻的活对象快照，空载的 runtime 没理由回收，收尾读数会一直报洪峰）；
+# 并且自己比对压测端 delivered 与 broker 的 messages_out，不等就 exit 1。
+# 端口 1980/1981，要 congmq 与 congmq-load 两个二进制，CONGMQ_SOAK_BASE_PORT 可换；约 7 分钟
+(cd test && npm run soak)
+
+# 部署形态的冒烟：对着一个**已经在跑**的 compose 拓扑（nginx 写头部 → broker）打一轮
+# 发布订阅，再核对 /metrics 与 /metrics.txt 里那两个头部计数器。它自己不起进程，
+# 所以这一步的意义完全在于前面那条命令真的把 nginx 起来了：
+#   docker compose -f deploy/docker-compose.yml up -d --build
+#   (cd test && npm run lb-smoke)
+#   docker compose -f deploy/docker-compose.yml down -v
+
 # 容量基线：同样自己起 broker（每行一个独立进程 + 独立 -store 目录），自己打流量
 # 它需要两个二进制，跑之前先 build（Windows 上把 .exe 补上）：
 #   go build -o bin/congmq ./cmd/congmq && go build -o bin/congmq-load ./cmd/congmq-load
 # TLS 那一组还要 congmq-cert
 #   go build -o bin/congmq-cert ./cmd/congmq-cert
-(cd test && node load-baseline.mjs)                 # 19 行，约 4 分钟，写 test/baseline-<日期>.md
+(cd test && node load-baseline.mjs)                 # 29 行，约 6 分钟，写 test/baseline-<日期>.md
 (cd test && node load-baseline.mjs --groups=pump --seconds=5)   # 只跑一组，快速回归
+(cd test && node load-baseline.mjs --groups=gate)   # 闸门 off / armed 不咬人 / 两条真咬人的对照
+(cd test && node load-baseline.mjs --groups=proxy)  # 头部 off / v1 / v2 / trusted，加一对"同一闸门、两种地址"的对照
 ```
 
 `internal/broker/restart_test.go` 里那几个用例是持久化的主力回归：
 一个 broker 关闭、`FileStore` 重新打开后，离线队列、订阅、保留消息、延迟遗嘱必须按原语义回来，
-在线会话的记录必须只剩订阅与身份。`crash-check.mjs` 是同一件事的黑盒版本——它杀真实进程。
+在线会话的记录必须只剩订阅与身份。恢复一族按"离原始进程多远"从近到远排开：
+`crash-check.mjs` 只杀真实进程、原地重启看能否捞回来（同一份二进制、同一个目录）；
+`restore-drill.mjs` 从**另一条路径上的拷贝**起另一个 broker（模拟运维的冷备份恢复），
+第二趟故意拷"备份时仍在写"的文件并从中途截断——它必须大声降级（报 `bytes_discarded`、
+砍到最后一条可信记录）而不是静默少东西；`rolling-upgrade.mjs` 从 `v1.0.0` 那个 tag 单独
+编一个二进制，两个方向各做一次跨版本接管（详见 §6）；`internal/store/lock_test.go` 把闸门
+自己钉住——第二个 `NewFileStore` 必须**拒绝启动**而不是静默盖过去，那是 §6 那个"47 条合法记录、
+20 条离线消息丢了"故事的直接来源。
 
-当前二进制上的实测结果（`bin/congmq.exe`，`go1.27.3`，Windows）：
+当前源码上的实测结果（`go1.27.3`，Windows；`proxy-check` 与 `--groups=gate` / `--groups=proxy`
+这两组基线跑的是同一份源码另 build 的 `.tmp/congmq.exe`——`bin/congmq.exe` 当时被一个长期开着的
+开发实例占着，Windows 写不进去）：
 
 ```
-conformance  27/27     v5-check  50/50     rules-check  all passed     tls-check  19/19     reload-check  35/35     crash-check  10/10
-load-baseline  19/19 行跑完，0 行失败；仪表自检 16/16 行 delivered == messages_out（表格见 §9）
+conformance  27/27     v5-check  50/50     rules-check  all passed     tls-check  19/19     reload-check  35/35     crash-check  10/10     abuse-check  38/38     proxy-check  30/30
+restore-drill  20/20 —— 三条腿：干净拷贝恢复、截断"仍在写"的文件必须大声降级（`bytes_discarded` 非零）、
+             三档 fsync 起回来的东西完全一样
+rolling-upgrade  30/30 —— 双向跨版本：v1.0.0 → 当前 98 条离线一条不缺、当前 → v1.0.0 101 条同理，
+               两个方向 sessionPresent 都为 true（不用重订阅），15.0s 遗嘱按原 deadline 准点；
+               第三条腿量"新进程抢在旧进程之前起"—— 现在直接 exit 1
+lb-smoke  7/7 —— 这台机器没装 Docker，所以那次是拿一个手写假前置（在本进程里按 v1 写头部）顶着 nginx 跑的，
+          证明的是冒烟脚本本身能咬；nginx 那一版要等 CI 的 docker job，本机说不了这句话
+load-baseline  23/23 行跑完，0 行失败；仪表自检 16/16 行有投递的都 delivered == messages_out，
+           闸门那四行的 connect_errors 全被 broker 的拒绝计数解释掉（表格见 §9；这一批还没有头部那六行）
+load-baseline --groups=gate  4/4 行跑完；自检 4/4 行的压测端 connect_errors == broker 侧的闸门拒绝数（表格见 §9）
+load-baseline --groups=proxy  6/6 行跑完；自检 6/6 行 connect_errors 被 broker 侧拒绝计数解释掉，
+          且 connections_over_proxy_header 六个行全对（四个开头部行 == 各自连上数、两个 off 行 == 0）（表格见 §9）
 ```
 
-Go 侧 `gofmt -l` 无输出、`go vet ./...` 干净、`go test -count=1 ./...` 全绿（broker 38.5s）。
+Go 侧 `gofmt -l` 无输出、`go vet ./...` 干净、`go test -count=1 ./...` 全绿（broker 41.9s）。
 
 这一层不用人守着：`.github/workflows/build.yml` 在每次 push 与 PR 上跑 `gofmt`、`go vet`、
-`go test`（ubuntu 与 windows 两个系统），再在 ubuntu 上把上面六个 Node 脚本逐个跑一遍；
-推 `v*` tag 时额外交叉编译六个平台，把归档与 `SHA256SUMS.txt` 挂到 Release。
+`go test`（ubuntu 与 windows 两个系统），再在 ubuntu 上把上面八个 Node 脚本（`lb-smoke` 除外，
+它要的是一个已经在跑的前置）逐个跑一遍；另有一个 `docker` job 把部署形态本身跑一遍——
+`docker build`、镜像里的 `-version` 必须等于源码里的 `const version`、`id` 必须是 `uid=10001`、
+`docker compose up --build` 起 nginx→broker、然后用**真的 mqtt.js 客户端穿过真的 nginx** 打一轮
+（`lb-smoke`），再核对 `connections_over_proxy_header` 因为这一轮而涨、`refused_over_proxy_header`
+一个没动，最后原地重启容器并确认 `state.log` 还在命名卷里。交叉编译与 Release 挂在
+`needs: [go, conformance, docker]` 之后：镜像起不来就不该有 Release。
+推 `v*` tag 时额外交叉编译六个平台，把归档与 `SHA256SUMS.txt` 挂到 Release；归档里除了二进制还带
+`Dockerfile`、`deploy/`（compose + nginx + systemd 两个单元文件）与 `LICENSE`。
 **tag 与 `cmd/congmq/main.go` 里的 `const version` 不一致就直接失败**——发出去的版本号必须等于
 二进制 `-version` 打印的那一个，宁可不发。`load-baseline` 不在 CI 里：基准必须在目标机器上跑，
 runner 的核数与磁盘不是你的机队会落到的地方。
@@ -530,6 +813,31 @@ pass  no session was evicted by a policy swap or a certificate rotation
 
 第一条是"坏文件不记账两遍"，第二条是"名字不是凭据、验过的链条才是"，第三条是整个阶段的那句承诺。
 
+传输头部这一层是 20 个 Go 用例加 30 个 Node 检查，两层的分工和 TLS 那层一样：
+`internal/proxyproto` 的 8 个钉**字节**（v1 文本、v2 二进制的地址块顺序、`ver_cmd` 的两个 nibble
+——`TestV2CommandNibblesAreTheSpecificationOwn` 就是钉"0x20 是 LOCAL 不是 PROXY"这一件事、
+头部之后的剩余字节一条都不许吃、`ErrNotProxy` 必须消耗零字节、108 字节的行上限、空连接、真 socket）；
+`internal/broker/proxy_test.go` 的 12 个钉**裁决**（require 拒绝非头部、两种头部形态都被接受、
+头部和 CONNECT 挤在同一段里也要解析得开、名单外写头部被拒、名单内直连保留 socket 地址、
+`LOCAL` / `UNKNOWN` 不算会话、静默对端在 header 超时那一刻被关掉、真实地址驱动每地址并发上限、
+驱动凭据锁定、驱动 ACL 的 `ip` 规则、被离线会话记住，以及 `ProxyOff` 一个头部都不读）。
+`proxy-check.mjs` 那 30 条钉的是**跨语言**：迷你前置在本进程里按规范逐字节写头部，会话是普通 mqtt.js 客户端，
+所以如果解析器读错了 nibble 或读错了偏移，症状就是"规则永远不命中"，而不是某个测试红了。它最值得看的三条：
+
+```
+pass  the same credentials from another claimed address are refused
+        -> refused:Connection refused: Bad username or password
+pass  and is the counter that says somebody tried
+        -> {"refused":1,"auth_rejected":2}
+pass  two devices behind one balancer are two addresses to the gate
+        -> {"entries":2,"refused":0}
+```
+
+第一条是"头部里的地址真的进了 auth"（注意它回的是**凭据**拒绝而不是头部拒绝——规则看见了设备，只是不喜欢它报的那个地址）；
+第二条是"有人试过伪造，而且这件事只存在于计数器里"（日志被节流，对端什么也收不到）；
+第三条是整个功能的存在理由：一个前置后面的两台设备，在闸门眼里必须是两个地址，否则 `-max-conns-per-ip`
+会把一整批设备算成一台很吵的机器。
+
 `crash-check` 里两个值得看的数字（下面是它打印的原话，`->` 是证据）：
 
 ```
@@ -560,16 +868,23 @@ pass  every message that had passed a flush tick came back, and only the newest 
 ```bash
 go build -o bin/congmq ./cmd/congmq && go build -o bin/congmq-load ./cmd/congmq-load \
   && go build -o bin/congmq-cert ./cmd/congmq-cert     # 最后一个只给 TLS 那一组用
-(cd test && node load-baseline.mjs)      # 19 行 × 10s，约 4 分钟，写 test/baseline-<日期>.md
+(cd test && node load-baseline.mjs)      # 29 行 × 10s，约 6 分钟，写 test/baseline-<日期>.md
+(cd test && node load-baseline.mjs --groups=gate)        # 只跑闸门那一组，约 1 分钟
+(cd test && node load-baseline.mjs --groups=proxy --out=proxy-baseline-run.md)   # 头部那一组，约 1.5 分钟
 ```
 
 每行一个**独立 broker 进程 + 独立 `-store` 目录**，流量由 `cmd/congmq-load` 打——它用
 `internal/packets`，和服务端同一套编解码，所以任何一个数字都不能用"第三方客户端不行"解释掉。
-脚本最后会自己核对压测端的 `delivered` 与 broker 的 `messages_out`，本次 **16/16 行相等**；
-不等就 `exit 1`，表不会安静地产出。
+脚本最后会自己核对压测端的 `delivered` 与 broker 的 `messages_out`，本次 **16/16 行相等**（pump / 载荷 / 扇出 / fsync / TLS 五组共 16 行有投递；连接、闸门、头部三组共 13 行是纯建连，没有投递可对）。
+闸门那一组还要反过来对一次账（`connect_errors` 必须被 broker 的拒绝计数解释掉，4/4 行成立）；
+头部那一组这两道都查，外加第三道：开了头部的行，`connections_over_proxy_header` 必须**等于**压测端连上的条数，`off` 那一行必须**等于 0**——这一道防的是"表里这一行其实根本没走头部"，行标签说了不算，broker 自己的计数器说了才算（本次 6/6 行成立）。
+任何一项不等就 `exit 1`，表不会安静地产出。
 
 环境：`win32 10.0.26100 x64` · 12 逻辑核 i5-12400F · 31.8 GiB 内存 · 压测端与被测端同机 loopback ·
-Go 1.27.3 · `test/baseline-2026-11-03.md` 是这批数字的原件（含逐行 JSON）。
+Go 1.27.3 · `test/baseline-2026-11-03.md` 是这批数字的原件（含逐行 JSON），闸门那一组是
+`test/gate-baseline-2026-11-03.md`、头部那一组是 `test/proxy-baseline-run.md`（都是同一台机器上另起 broker 单独跑的两批；
+这两批的 broker 与压测端都是同一份源码另 build 的 `.tmp/congmq.exe` / `.tmp/congmq-load.exe`，
+因为 `bin/congmq.exe` 当时被一个开发实例占着，Windows 写不进去——两份原件的表头就写着它们各自用的哪一份）。
 每一行的 broker 都带 `-reload-interval 2s` 启动，也就是说下面所有数字都是**热重载开着的时候测的**。
 文中「上一批」指本文件此前发布的那一批，它的运行原件留在 `test/baseline-run-pre-b1.log`；
 再早的一批（没有 TLS 对照行的那一批）留在 `test/baseline-2026-11-03-0349z.md`。跨批引用只引这两个文件里的数。
@@ -603,6 +918,85 @@ goroutine 恰好 3 条/连接（`internal/broker/broker.go:430-432` 的 readLoop
 `mem_sys` 是 70.0 / 290.9 / 561.6 MiB，上一批 70.0 / 311.5 / 622.2——1k 那行一模一样，后两行这一批还**更低**，
 所以那点差是抖动，不是重载器；重载器的成本只在协程那一列看得见。**不停机运维的价格是一条协程**，
 连接数再多也不涨。
+
+### 接入闸门的代价（per-address gate）
+
+同一份二进制、同一批 3,000 条连接，只差启动参数（原件 `test/gate-baseline-2026-11-03.md`）：
+
+| 场景 | 计划建连 | 连上 | 压测端报错 | broker 在线 | 闸门拒绝（并发/速率） | 表项/持有 socket | goroutines | mem_sys (MiB) | 每连接活跃 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 闸门全关（默认） | 3,000 | 3,000 | 0 | 3,000 | 0 / 0 | 0 / 0 | 9,011 | 172.8 | 27.9 KiB |
+| 闸门开着但一个都没卡 | 3,000 | 3,000 | 0 | 3,000 | 0 / 0 | 1 / 3,000 | 9,011 | 188.7 | 27.8 KiB |
+| `-max-conns-per-ip 500` | 3,000 | 500 | 2,500 | 500 | 2,500 / 0 | 1 / 500 | 1,511 | 41.5 | 32.0 KiB |
+| `-conn-rate-per-ip 300` | 3,000 | 343 | 2,657 | 343 | 0 / 2,657 | 1 / 343 | 1,040 | 33.5 | 33.5 KiB |
+
+四行读出来的结论：
+
+- **关着就是不存在的**：表项 0、持有 0、两个拒绝计数 0，启动日志里连 `per-address gate armed`
+  那一行都没有。9,011 条 goroutine = 3×3,000 + 11，和上面那张连接成本表的斜率严丝合缝。
+- **开着但没咬到人也不收费**：两行都是 3,000 条全上来，ramp 256ms 对 259ms（11,696 对
+  11,569 conn/s，差 1.1%）、goroutine 一模一样 9,011、每连接活跃 27.9 对 27.8 KiB。`mem_sys`
+  那 16 MiB（9%）的差是 Go 什么时候决定多拿一页的问题——同一份代码两次跑批见过比这更大的差
+  （见上面 `dropped` 那段）——活对象那一列没有变贵，装了闸门的进程反而比全关那行少 0.4 MB。
+- **咬人的时候，账是平的**：`连上 + 闸门拒绝 = 计划建连`，两行都精确成立（500+2,500、343+2,657），
+  而且 `broker 在线` 始终等于 `连上`——被关掉的那部分从未变成会话，一条 goroutine、一份读截止都没占。
+  300/s 那行落进 343 条，是令牌桶的算术：burst 300 加上爬坡 146ms 里补进来的 43。
+- **这就是它的意义**：同样一场 3,000 条的建连风暴，内存从 172.8 MiB 回到 41.5 MiB，协程从
+  9,011 回到 1,511（限速那行 1,040）。能被占多少资源，由你给的那个数字决定，不再由对面发多少连接决定。
+
+每连接活跃在咬人的两行略高（32.0 / 33.5 对 27.9 KiB）是**基数效应**：那一列是从 `settled - 建连前`
+再除以在线数算的，只剩 500 条甚至 343 条时进程自身的固定开销摊薄不足。上面 1k 那行（28.7）比 10k 那行（28.3）
+高也是同一个原因，不是连接变贵了。
+
+这一组只测了"每条都发了 CONNECT"的建连风暴。一个字节都不发的裸 socket 那一维不在这里——
+压测端的每条连接都会握手，它看不到那种负载；那由 `test/abuse-check.mjs` 的 `silentSocket`
+和 `internal/broker/abuse_test.go` 覆盖（§8）。
+
+### 传输头部的代价（PROXY protocol）
+
+同一份二进制跑了六行：前四行只差启动参数和压测端写不写头部，后两行是同一个闸门配置的两种地址来源
+（原件 `test/proxy-baseline-run.md`，头部由 `cmd/congmq-load -proxy-header v1|v2` 自己写——
+它在 TLS 包装之前、按规范和 nginx 一样的位置写，所以这一组测的是**本机解析这一层的代价**，
+不含真实前置那台机器抢 CPU 的那一维）：
+
+| 场景 | 计划建连 | 连上 | 压测端报错 | broker 在线 | 头部会话/头部拒绝 | 闸门拒绝 | 表项/持有 socket | goroutines | mem_sys (MiB) | 每连接活跃 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 3,000 长连接 · 头部 off（默认） | 3,000 | 3,000 | 0 | 3,000 | 0 / 0 | 0 | 0 / 0 | 9,011 | 189.0 | 27.6 KiB |
+| 3,000 长连接 · require + v1 文本 | 3,000 | 3,000 | 0 | 3,000 | 3,000 / 0 | 0 | 0 / 0 | 9,011 | 184.7 | 29.2 KiB |
+| 3,000 长连接 · require + v2 二进制 | 3,000 | 3,000 | 0 | 3,000 | 3,000 / 0 | 0 | 0 / 0 | 9,011 | 180.9 | 28.8 KiB |
+| 3,000 长连接 · trusted + v1（名单 127.0.0.0/8） | 3,000 | 3,000 | 0 | 3,000 | 3,000 / 0 | 0 | 0 / 0 | 9,011 | 188.5 | 29.5 KiB |
+| 1,000 长连接 · 闸门 600 + 两个申报地址（require + v1） | 1,000 | 1,000 | 0 | 1,000 | 1,000 / 0 | 0 | 2 / 1,000 | 3,011 | 70.0 | 29.4 KiB |
+| 1,000 长连接 · 同一闸门、头部 off（对照） | 1,000 | 600 | 400 | 600 | 0 / 0 | 400 | 1 / 600 | 1,811 | 45.5 | 29.2 KiB |
+
+- **稳态协程一条不多**：四行 3,000 连接的 goroutine 全是 9,011，和上面那张连接成本表的 3×N+11 完全一致。
+  开了头部的路径确实多一条**短命**协程——`handleOne` 把读头部挪进协程里，就是为了让一个连上就沉默的对端
+  占不住 accept 循环（§4）；但 9,011 这个数说明这些协程在取样时已经全部退出——多的那条协程是短命的，
+  常驻的是下面那一列说的那点内存。v1 与 v2 之间也分不出差（29.2 对 28.8 KiB，ramp 213ms 对 211ms）。
+- **每连接活跃 +1.2~1.9 KiB**（27.6 → 28.8/29.2/29.5），三行头部都在这个区间、方向一致，所以量级可以采信；
+  但别读成精确值——同一份 `off` 配置在闸门那批测的是 27.9 / 27.8 KiB，比这一批的 27.6 还高，
+  说明这一列本身有 ±1 KiB 的行间抖动。按上限算，一万个连接多摊 12–19 MiB。
+  这一层的常驻结构本来就装不下 1.5 KiB：包装一个 `net.Conn` 加它那个 128 字节的读缓冲
+  （`internal/broker/proxy.go:168`，缓冲解析完不丢，后面的报文解码继续从它里面读），
+  剩下的多半在栈上——读路径从此多绕一层接口。`mem_sys` 那一列反而开了头部的更低（180.9–188.5 对 189.0），
+  再次印证 Go 什么时候多拿一页不由这一层决定。
+- **ramp 那一列不能反过来读**：`off` 是这一批的**第一行**，10,513 conn/s 对后面三行的 14,070–14,209。
+  头部不会让建连变快，那是第一个进程独占了页错误和 GC 起步的代价。要看建连速率就横向比同批的后三行。
+- **真正值得看的是最后两行**：同一个 `-max-conns-per-ip 600`、同样 1,000 条连接。头部关着时这 1,000 条
+  全从一个 socket 地址进来，闸门眼里只有**一个表项**，于是 600 的含义悄悄变成"这台前置总共 600 条"，
+  第 601 到第 1,000 条被关掉（`闸门拒绝 400`、`连上 + 拒绝 = 计划建连` 依然严格成立）。
+  头部开着、申报两个地址时，表项变成 **2**，1,000 条全部被持有，闸门一次都没咬。
+  **这一对数字就是整个功能的存在理由**：600 这个数在两种情况下含义完全不同，
+  而关掉那一行的 400 条设备只看到"连不上"，broker 侧一切正常。
+- **开了头部那行更贵，是它在工作**：70.0 MiB / 3,011 协程 对 45.5 MiB / 1,811，差的正是多出来的 400 个真会话。
+  传输头部不是省资源的开关，它让该进来的进来。
+- **卡在头部不放的连接不会常驻**：只写了十二字节签名、后面的内容不写完的对端，在 `-proxy-header-timeout`
+  到点时被关掉并记一次 `refused_over_proxy_header`。这时会话、队列、订阅都还没建，占的是那一条短命协程
+  和它的读缓冲。`test/proxy-check.mjs` 用 `-proxy-header-timeout 400ms` 的 broker 钉住这两件事：
+  几百毫秒内断开（不是等满预连接窗口），且计数器加一。
+
+一组里 6/6 行的 `connect_errors` 都能被 broker 侧的拒绝计数解释掉（唯一的 400 条 = 闸门 400 + 头部 0），
+且四个开了头部的行 `connections_over_proxy_header` 精确等于各自的 `连上`、两个 `off` 行精确等于 0——
+所以这张表读的是什么，是 broker 自己报的，不是行标签说的。
 
 ### QoS 吞吐
 
@@ -733,13 +1127,20 @@ goroutine 恰好 3 条/连接（`internal/broker/broker.go:430-432` 的 readLoop
 在途报文 = 连接数 × min(-inflight-window, 对端 Receive Maximum) × 平均报文字节
 ```
 
+离线队列那一行的两个系数是实测来的，不是 `平均报文字节` 本身：
+24,000 条 256B 的消息压在 20 个离线会话里，活跃堆从 0.4 MiB 涨到 8.4 MiB（≈ **350 B/条**，含 payload 与
+`Message` 头部、切片的对齐损耗），会话被回收之后回到 0.5 MiB——这条在 `internal/broker/memory_test.go` 里钉着。
+同一批消息写进 `state.log` 是 **517 B/条**（浸泡实测峰值 35,492 条 ↔ 17.5 MB 文件）：JSON 里 payload 走 base64
+（256B → 342B），再加主题、packet id、字段名。**所以磁盘按消息条数乘 500B 估，别按报文大小估。**
+还要记住 §6 那条：文件缩回的前提是追加量再过一遍压缩阈值，所以磁盘的下限是**峰值驻留**而不是稳态驻留。
+
 吞吐侧：这台机器 QoS 1 端到端 10.6 万条/秒（压测端同机抢 CPU，独占部署更高），
 5 万条设备 × 每 10 秒 1 条 = 5 千条/秒，离饱和差一个数量级——**设备数先撞内存，速率后撞 CPU**。
 加密与否对这个结论没有影响（TLS 那两行差 0.6%，见上面）。
 
 ### 这套表怎么保证不是假数字
 
-压测最容易出的错是数字错了还看不出来。四道防线，都已经写进脚本，不是写在文档里：
+压测最容易出的错是数字错了还看不出来。六道防线，都已经写进脚本，不是写在文档里：
 
 - **压测端和服务端共用一套编解码**（`internal/packets`），出了问题只有一个责任方；用第三方客户端打，
   第一次异常永远是"客户端实现不行"。
@@ -753,6 +1154,18 @@ goroutine 恰好 3 条/连接（`internal/broker/broker.go:430-432` 的 readLoop
   `SetNoDelay` 属于底层的 `*net.TCPConn`，套上 `tls.Conn` 就摸不到了，所以两端都在**包装之前**设。
 - **延迟不骗自己**：本机 `time.Now()` 的步进实测 0.31–0.51 ms，亚毫秒的单跳用同进程共享的单调基准
   （`time.Since(procStart)`）打时间戳，每行自己的 tick 也写进 JSON；低于 tick 的格子印 `†`，不印 0 ms。
+- **闸门与头部那一组还多加一道反向对账**：一条被关掉的连接，压测端看到的是"建连失败"，broker 看到的是
+  "拒绝了一次"，所以脚本要求 `connect_errors` 必须能被 broker 侧的拒绝计数（闸门两种 + 头部一种）解释掉，
+  解释不掉就 `exit 1`。
+  它一上来就抓到过一张假表：第一版把 10,000 条连接的行连跑四遍，从第二行起 Windows 的动态端口范围
+  已经不够用，表里那 2,109 条"失败"其实是压测端自己没拿到 socket——同一时刻 broker 的闸门拒绝数是 **0**。
+  没有这道对账，那张表读起来就像"限流只挡住了一半"。现在这些行缩到 3,000 条，四行都对得上
+  （500+2,500、343+2,657 都正好等于计划建连数）。
+- **头部那一组还要证明"这一行真的走了头部"**：行标签说自己开了 `require + v1`，但那只是脚本的参数，
+  broker 可能压根没读到头部（压测端忘写、写歪、被前面的分支绕开）。所以脚本再要求一次：
+  开了头部的行 `connections_over_proxy_header` 必须**等于**压测端连上的条数，`off` 的行必须**等于 0**。
+  它把"这一行读的是什么"从脚本的自述变成 broker 的证词——上面那张表六个行里，四个开了头部的各自等于
+  那一行的连上数，两个 `off` 的各自等于 0。
 
 顺带记两个压测端自己的坑，都会把数字打得"看起来很糟"：令牌桶的容量下限要留 1 个令牌，
 否则 `-rate` 给小了会永久饿死；每行必须换独立 broker 进程和独立 `-store`，
@@ -769,6 +1182,14 @@ goroutine 恰好 3 条/连接（`internal/broker/broker.go:430-432` 的 readLoop
    建议 `max-packet-size × max-conns` 与进程内存上限一起算。
 2. **`-max-conns` 按业务量设**，别用默认不限。每连接 56 KiB 预留是实测值（§9 的 1k→10k 斜率），
    乘上去就是内存下限，再加离线队列那一项。
+   要不要再加**按地址**的那三个（`-max-conns-per-ip` / `-conn-rate-per-ip` / `-auth-fail-limit`），
+   取决于你的入站形状，先量一遍 `/metrics` 里的 `per_ip_gate_*` 和 `auth_*` 再决定，别一次全开：
+   ① 机队在一个 NAT 出口后面 → 按地址限会一次锁掉一整批设备，这种拓扑该用的是 `-max-conns` 和规则里的 `clientid`；
+   ② 前面挂了云 LB 且**没有 PROXY protocol**（见第 4 条）→ 所有连接的来源地址都是那台 LB，
+   按地址设限等于给 LB 设限，锁定更是会把整个入口一起锁掉；
+   ③ 公网直挂、且日志里见过扫端口的（`auth_rejected` 在涨而 `online` 没涨）→ 这三个正是为这种场景准备的，
+   从宽往严收：`-max-conns-per-ip` 给到单地址实际峰值的 2–3 倍，`-conn-rate-per-ip` 用 `0.5` 这类小数起步。
+   开之前先跑一遍 `npm run abuse-check`，它会把四个 broker 的裁决和拒绝计数都打给你看（§8）。
 3. **TLS 自己终结**：`-tls-addr :8883` + `-tls-cert/-tls-key`，要认设备就再加 `-tls-ca`（那就是 mTLS）。
    先用 `./bin/congmq-cert -out /etc/congmq/pki -days 365 -dns <客户端实际连的那个名字>` 造一条链把通路跑通，
    再换成真证书。三个坑：
@@ -778,21 +1199,44 @@ goroutine 恰好 3 条/连接（`internal/broker/broker.go:430-432` 的 readLoop
    `server.crt` / `server.key` / `ca.crt` 写回同一路径，一个 `-reload-interval` 周期之内下一个握手就答新一代，
    已经连着的会话继续用它握手时那一代（不会被打断）。但 broker **不续期**，到期前得有人把文件放上去，
    所以给 `tls_cert_not_after_unix` 设告警（§7）。
-   仍然放在云 LB / Nginx 后面也可以，但 broker 只认 TCP 对端地址——**不支持 PROXY protocol**，
-   所以那种拓扑下 `ip` 规则匹配到的是 LB，不是设备。
-4. **`-metrics` 只绑 127.0.0.1** 或监控网段：三个口全都没有鉴权。`/readyz` 给 LB / 探针（drain 期间返回
+   仍然放在云 LB / Nginx 后面也可以，而且那种拓扑下的来源地址现在有解了：前置写 PROXY protocol 头部、
+   broker 读它（下面第 4 条）。不读头部的话，`ip` 规则匹配到的是 LB，不是设备。
+4. **前面挂了负载均衡就必须开 `-proxy-protocol`**，否则每一条按地址的裁决都在判错机器——闸门给 LB 限流、
+   `ip` 规则永远命中不了、锁定会把整个入口一起锁掉、日志里的 `remote` 是一个内网 IP。两种形态选一种：
+   ① 这个端口只允许前置访问 → `-proxy-protocol require`，直连进来的 socket 一律挂断。两者中更严的那个，
+   它把"绕过前置直接打 broker"变成一件不可能的事，代价是这个端口再也收不了直连设备；② 这个端口既要收前置也要收直连 →
+   `-proxy-protocol trusted -trusted-proxy-cidr <前置网段>`，名单外发头部的连接**被拒而不是被忽略**。
+   云 LB 要显式打开 PROXY protocol（AWS NLB 两种版本都能发，nginx 的 `stream` 模块只发 v1 文本，
+   `deploy/nginx/nginx.conf` 是可用的参照；其余厂商先确认自己那款发的是哪一版再配），并且**只打开这一个开关**——
+   不要指望 LB 顺手证明地址是真的：
+   头部里的地址是前置**说**出来的，不是被**证明**的（§11）。上真实拓扑前先跑 `npm run proxy-check`（§8），
+   它会把"名单外伪造一个地址"和"前置没发头部"这两种故障分别打给你看。
+5. **容器 / systemd 落地**：`deploy/docker-compose.yml` 是 nginx→broker 的完整拓扑，`deploy/systemd/`
+   是两个单元文件（`congmq.service` + `/etc/default/congmq`）。三条要在自己的机器上确认的事：
+   ① 镜像不带规则文件也不带证书，都用挂载进去（`/etc/congmq` 只读挂载就是热加载的入口，见 §2）；
+   ② `docker build` 与 `compose up` 只在 CI 里被真跑过（见 §8），本机没装 Docker 就别说它"应该能起"；
+   ③ systemd 那份 `EnvironmentFile` **不做变量展开**，所以 `/etc/default/congmq` 里是整行替换
+   `CONGMQ_ARGS=...`，不是往里拼片段。
+6. **`-metrics` 只绑 127.0.0.1** 或监控网段：三个口全都没有鉴权。`/readyz` 给 LB / 探针（drain 期间返回
    503，于是新连接被摘掉而最后的计数器仍可读），`/metrics.txt` 给 Prometheus 抓，`/metrics` 留给人 curl。
-5. **`-store` 给独立可写目录**，并把它纳入备份/巡检范围（一个 `state.log` 就是全部状态）。
-   文件系统选 ext4/xfs；网络盘上 fsync 的代价会被放大。
-6. **`-queue-max` 与 `-session-expiry-max` 一起设**：离线队列是无界磁盘占用的主要来源，
+7. **`-store` 给独立可写目录**，并把它纳入备份/巡检范围（一个 `state.log` 就是全部状态）。
+   文件系统选 ext4/xfs；网络盘上 fsync 的代价会被放大。容器里它就是命名卷——`compose restart` 之后
+   `ls -l /var/lib/congmq/state.log` 还在，才算"换容器不丢状态"这句话被验证过（CI 的 docker job 每次都在做这件事）。
+   目录里的第二个文件 `state.lock` 只被持有、不写内容，备份不需要它，也**别删**它（§6）。
+   **一个 `-store` 目录只允许一个进程**：升级与回滚都要"先确认旧的退干净、再起新的"。新版本会拒绝第二个
+   进程并 `exit 1`（两个进程各按自己的偏移追加，后写的把前者的记录盖掉，而 CRC 全对——实测这样丢过 20 条
+   已确认消息，见 §6）；v1.0.0 没有这段代码，所以回滚方向只能靠流程保证。跨版本接管本身实测过双向
+   （`npm run rolling-upgrade`：98 / 101 条离线消息跨版本一条不缺、会话 `sessionPresent=true` 不用重订阅、
+   保留消息与延迟遗嘱照准点）。
+8. **`-queue-max` 与 `-session-expiry-max` 一起设**：离线队列是无界磁盘占用的主要来源，
    后者封顶"客户端不回来"的会话存活时间。
-7. 规则文件先在一台灰度机上验证再全量：**启动期**加载失败直接 `exit 1`（这是有意的）。
+9. 规则文件先在一台灰度机上验证再全量：**启动期**加载失败直接 `exit 1`（这是有意的）。
    **运行期**改写失败不会打断服务，但也**没装上**——所以推完别只看推送成功，去比一下
    `rules_generation` 加了几、`rules_reload_failures` 有没有从 0 动过（§5、§7）。
-8. 热加载的三种形态先想清楚用哪种：默认 `-reload-interval 2s` 轮询（Windows 唯一可行）；
+10. 热加载的三种形态先想清楚用哪种：默认 `-reload-interval 2s` 轮询（Windows 唯一可行）；
    unix 上想立刻生效就 `SIGHUP`；`-reload-interval 0` 表示**只认信号**——那种"改文件必须有人明确
    按一下"的流程，此时在 Windows 上等于不热加载，启动日志会直说。
-9. systemd 例子（`ExecReload` 就是给 SIGHUP 用的；不配它也没关系，轮询本来就会查）：
+11. systemd 例子（`ExecReload` 就是给 SIGHUP 用的；不配它也没关系，轮询本来就会查）：
 
 ```ini
 [Service]
@@ -854,5 +1298,52 @@ kill -9 <pid>                                        # 模拟掉电/被杀
   能握手成功，但 CertCN 留空——未校验的 CN 是客户端自己填的，拿它认证等于把门禁交给访客自己写。
 - **慢订阅者被断开前先落盘**。3.1.1 没有流控，保护发布者只能牺牲订阅者，那就不能让它牺牲完还丢消息。
 - **写失败只报警，不断开连接**。磁盘满不是发布者的错，把错误传导给客户端只会放大成雪崩。
+- **限流判定在 accept，不在 CONNECT**。CONNECT 处设限只量得到"会话"，而一个只建 TCP、一个字节都不发的
+  对端永远走不到 CONNECT——它白占一个 socket、一个读截止和三条协程，一直到 30s 的 pre-connect 截止。
+  代价是被拒的连接收不到任何解释（没有 CONNACK 可回，只能挂断），谁被挡了多少只能从
+  `refused_over_per_ip_*` 里读；买回来的是"风暴在最便宜的那一步就被挡掉，且一条会话都不曾建立"——
+  §9 那两行 500 / 343 就是把这件事称出来的。
+- **凭据失败是拒绝，不是 sleep**。让爆破者慢下来最直觉的做法是叫他多等一会儿，但等待期间
+  那个 socket、那三条协程和那份读截止全是你自己付的——用一个正在被打的进程去计时，等于把攻击放大一层。
+  所以锁定只回一个和凭据错误**一模一样**的 `0x04`。代价写在 §4：锁定期内连对的密码也被拒，
+  而且这条没有"先认出来是自己人再放行"的余地——一旦允许正确密码绕过锁定，锁定本身就成了一条探测接口。
+- **按地址设限的东西，默认全是 0**。IPv6 取 /64、NAT 后面一整批设备共用一个 IP，这不是可以两边都讨好的
+  设计：管得粗会咬到自己人，管得细就挡不住谁。所以每一项都要显式打开，`-auth-fail-limit` 还额外要求
+  必须有 `-auth`（没有规则文件时每个凭据都通过，那就没有失败可计——一个永远不会触发的限流参数
+  比没有更糟，`exit 2` 说清楚）。
+- **传输头部默认 `off`，而且是两条代码路径而不是一个开关**。`off` 时 `b.proxy` 是 nil，accept 路径上
+  不建包装、不缓冲、不开协程——一个没要求这个功能的 broker 一行都不为它付。代价是要付出时才付：armed
+  之后每条连接一个短命协程 + 128 字节缓冲，因为读头部用的是对端的日程表，一个连上就沉默的对端不该让
+  accept 循环等满五秒。为什么不做成"总是试着读一下"：那会让直连客户端的第一段 CONNECT 多一次带超时的读，
+  而 `ErrNotProxy` 必须消耗零字节的契约（`TestNotAHeaderConsumesNothing`）也就成了每天都得依赖的东西。
+- **头部里那个地址是被断言的，不是被证明的**。PROXY protocol 本身没有任何鉴权，v2 尾部的 TLV 也只是
+  按长度跳过、不校验，所以我们能判的只有一件事——**谁能往这个端口写包**。`-trusted-proxy-cidr` 就是这条
+  信任边界写成的一行配置，网络可达性是它唯一的凭据。这就是 `require` 存在的原因：一个只有前置进得来的
+  端口上，"断言"和"事实"第一次重合。代价是这份文档不能替你的安全组说话——`deploy/docker-compose.yml`
+  故意不把 1883 发布到宿主机，就是因为一旦有旁路，`refused_over_proxy_header` 之外的一切裁决又回到判错机器。
+- **名单外发头部是拒绝，不是忽略**。忽略的写法更好过日子（透明代理偶尔注入头部也照样能连），但它把
+  "有人在自己不是前置的时候冒充前置"降格成了一行都不留的事件。拒绝之后这件事只存在于
+  `refused_over_proxy_header` 和一条每 100 次才打一行的日志里——不对称是故意的，探测要付的是失败而不是痕迹。
+  代价是混用监听口上的一种真实故障：某台中间设备（透明代理、某些云 NAT）自己注入了头部，
+  而它的客户端并不在名单里——那种拓扑要么把网段加进名单，要么用 `require` 让前置成为唯一入口。
+- **v1 与 v2 都读，而不是只读自己测试里那一种**。真实拓扑里两种都会出现：nginx 的 `stream` 只发 v1 文本，
+  云厂商的 L4 大多发 v2 二进制。代价是一份解析器、两套字节布局、两套边界测试（文本的 108 字节行上限 vs
+  二进制的"16 + 自己声明的长度"），加上一个必须逐字对齐规范的 nibble 约定（`0x20` 是 LOCAL、`0x21` 是 PROXY——
+  写反了的症状是健康检查变成会话、而会话变成拒绝）。
+- **镜像用 `golang:1.27-alpine` 构建，而 `go.mod` 只写 `go 1.24`**。这两个数字不冲突：下面那个是这个仓库
+  的语言下限（用到的特性到这里为止），上面那个是实际编译它的编译器（带当前补丁的那一个）。
+  代价是"`go 1.24` 也编得过"这句话 CI 并没有覆盖——CI 覆盖的是镜像那条路径，这也是为什么
+  `docker` job 要拿镜像自己打印的 `-version` 去比 `cmd/congmq/main.go` 里的 `const version`。
+- **容器镜像里不带规则、不带证书**。镜像是可替换的工件，策略是部署处的数据，热加载要的是"把文件写回
+  原路径"这一件事——把它们烤进镜像就两头都丢了。代价很硬：默认 `CMD` 没有 `-auth`，裸 `docker run`
+  起来的是一个开放 broker（§2 第一条说的就是它）。所以 compose 那份 `command:` 覆盖了默认值，
+  而 `/etc/congmq` 是只读挂载（只读不影响轮询：它只 stat 和读）。
 - **`-race` 在本机跑不了**（需要 cgo/gcc）。这条限制是环境性的，不是代码的；有 gcc 的机器直接
   `go test -race ./...` 即可。
+
+## 12. 许可
+
+MIT（见 `LICENSE`）。选它而不是更严格的许可证，是因为这仓库的目的是让人**敢把设备交给它**：
+源码可以直接读、可以改、可以闭源分发，唯一条件是把版权与许可声明一起带上。
+代价是没有任何明示担保——`THE SOFTWARE IS PROVIDED "AS IS"`。
+「行为在源码注释里说清为什么这样取舍」是这项目实际提供的保证，它不写在许可证里。

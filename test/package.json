@@ -11,6 +11,13 @@
     "tls-check": "node tls-check.mjs",
     "reload-check": "node reload-check.mjs",
     "crash-check": "node crash-check.mjs",
+    "abuse-check": "node abuse-check.mjs",
+    "proxy-check": "node proxy-check.mjs",
+    "interop": "node interop-check.mjs",
+    "restore-drill": "node restore-drill.mjs",
+    "rolling-upgrade": "node rolling-upgrade.mjs",
+    "soak": "node soak-check.mjs",
+    "lb-smoke": "node lb-smoke.mjs",
     "load-baseline": "node load-baseline.mjs"
   },
   "dependencies": {

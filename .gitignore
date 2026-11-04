@@ -4,6 +4,9 @@ bin/
 # Node 工具层的依赖只装在 test/ 下（mqtt / mqtt-packet）。
 test/node_modules/
 
+# 互操作跑的是 Python，py_compile 与 import 都会留下字节码缓存。
+/test/__pycache__/
+
 # 手工排障时的临时目录。
 /.tmp/
 

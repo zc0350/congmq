@@ -1,0 +1,22 @@
+# 构建上下文是仓库根（deploy/docker-compose.yml 里 context: ..），
+# 但镜像只需要 go.mod + cmd/ + internal/ 三样。列在这里的不是"垃圾"，
+# 是"别把它们塞进发给 daemon 的 tar 包"：test/node_modules 有几十 MB，
+# .git 会随着提交越来越大，而它们对一次 build 没有任何贡献。
+.git
+.gitattributes
+.github
+.gitignore
+.dockerignore
+Dockerfile
+README.md
+LICENSE
+
+.tmp/
+bin/
+dist/
+/store/
+state.log
+
+test/
+deploy/
+rules/

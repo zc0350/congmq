@@ -558,12 +558,19 @@ func TestFileStoreCompactionKeepsTheFileBounded(t *testing.T) {
 	if size > 8<<10 {
 		t.Errorf("the store file grew to %d bytes with an 8KB compaction threshold", size)
 	}
+	// store_bytes is the same number an operator would get from ls, and it is the
+	// only way to tell a file compaction is holding down from one that stopped.
+	if got := fs.DiskBytes(); got != size {
+		t.Errorf("DiskBytes = %d, want the %d bytes the file actually holds", got, size)
+	}
+	// The log and the lock handle are the only two files allowed here: a leftover
+	// state.log.compact would mean the rename never finished.
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		t.Fatalf("read dir: %v", err)
 	}
-	if len(entries) != 1 || entries[0].Name() != stateFileName {
-		t.Fatalf("store directory holds %v, want only %s", names(entries), stateFileName)
+	if len(entries) != 2 || entries[0].Name() != lockFileName || entries[1].Name() != stateFileName {
+		t.Fatalf("store directory holds %v, want %s and %s", names(entries), lockFileName, stateFileName)
 	}
 
 	if err := fs.Close(); err != nil {
@@ -643,5 +650,60 @@ func TestFileStoreRemembersALiveSession(t *testing.T) {
 	}
 	if len(got.Subscriptions) != 1 {
 		t.Errorf("the session came back with %d subscriptions, want the one it had", len(got.Subscriptions))
+	}
+}
+
+// TestExpiredAndStatsReadTheStoreWithoutDetachingIt pins the two methods the
+// reaper and store_bytes rely on. Expired must answer with identifiers alone:
+// the reaper asks once a tick, and a scan that deep-copied every queued message
+// of every offline client would cost more than the deliveries it is tidying up.
+func TestExpiredAndStatsReadTheStoreWithoutDetachingIt(t *testing.T) {
+	ranOut := time.Now().Add(-time.Second)
+	stores := []struct {
+		name string
+		open func(t *testing.T) Store
+	}{
+		{"memory", func(*testing.T) Store { return NewMemoryStore() }},
+		{"file", func(t *testing.T) Store { return openStore(t, t.TempDir(), nil) }},
+	}
+	queue := []Message{
+		{Topic: "a", Payload: []byte("one"), QoS: 1},
+		{Topic: "a", Payload: []byte("two"), QoS: 1},
+	}
+
+	for _, tc := range stores {
+		t.Run(tc.name, func(t *testing.T) {
+			st := tc.open(t)
+			mustPut(t, st, &Session{ClientID: "gone", Queued: queue, Expiry: ranOut})
+			mustPut(t, st, &Session{ClientID: "kept", Queued: queue[:1], Expiry: time.Now().Add(time.Hour)})
+			// A 3.1.1 session carries no expiry at all and must never be reaped.
+			mustPut(t, st, &Session{ClientID: "forever", Queued: queue})
+
+			if got := st.Expired(time.Now()); len(got) != 1 || got[0] != "gone" {
+				t.Errorf("Expired = %v, want only the session whose clock ran out", got)
+			}
+			if s := st.Stats(); s.Sessions != 3 || s.Queued != 5 {
+				t.Errorf("Stats = %+v, want 3 sessions holding 5 queued messages", s)
+			}
+
+			// Naming the dead ones is the store's job; ending them is the
+			// broker's, and the residency has to follow the delete.
+			if err := st.Delete("gone"); err != nil {
+				t.Fatalf("delete: %v", err)
+			}
+			if s := st.Stats(); s.Sessions != 2 || s.Queued != 3 {
+				t.Errorf("Stats = %+v after the reap, want the gone session's queue dropped", s)
+			}
+			if n := len(st.Expired(time.Now())); n != 0 {
+				t.Errorf("Expired still reports %d sessions after the delete", n)
+			}
+		})
+	}
+}
+
+func mustPut(t *testing.T, st Store, s *Session) {
+	t.Helper()
+	if err := st.Put(s); err != nil {
+		t.Fatalf("put %s: %v", s.ClientID, err)
 	}
 }

@@ -6,8 +6,10 @@ import (
 	"crypto/tls"
 	"flag"
 	"log/slog"
+	"net/netip"
 	"os"
 	"os/signal"
+	"slices"
 	"strings"
 	"syscall"
 	"time"
@@ -18,7 +20,7 @@ import (
 )
 
 // The release workflow refuses to publish when this and the git tag disagree.
-const version = "1.0.0"
+const version = "1.1.0"
 
 func main() {
 	var (
@@ -30,6 +32,7 @@ func main() {
 		window    = flag.Int("inflight-window", 100, "unacknowledged messages outstanding per client")
 		mailbox   = flag.Int("mailbox-size", 256, "per-connection handoff queue depth")
 		maxConns  = flag.Int("max-conns", 0, "connection limit, 0 for unlimited")
+		maxSubs   = flag.Int("max-subs", 0, "topic filters one client may hold at once, 0 for unlimited")
 		retry     = flag.Duration("retry-interval", 5*time.Second, "resend interval for unacknowledged messages")
 		writeTO   = flag.Duration("write-timeout", 10*time.Second, "deadline for a single socket write")
 		deliverTO = flag.Duration("deliver-timeout", 5*time.Second, "how long a slow subscriber may stall a publisher")
@@ -65,6 +68,33 @@ func main() {
 		tlsMinVer    = flag.String("tls-min-version", "1.2", "lowest TLS version accepted: 1.2 or 1.3")
 		tlsHandshake = flag.Duration("tls-handshake-timeout", 10*time.Second, "how long a client may take to finish a TLS handshake")
 
+		// Abuse resistance. All three are off by default, because the broker cannot
+		// tell a factory floor behind one NAT from a connect storm — both look like
+		// a single address asking for many connections. Whoever knows which one they
+		// are running turns them on, and the counters say what got refused.
+		maxConnsIP  = flag.Int("max-conns-per-ip", 0, "connections one source address may hold at once, 0 for unlimited")
+		connRateIP  = flag.Float64("conn-rate-per-ip", 0, "new connections per second one source address may start, 0 for unmetered; 0.2 is one every five seconds")
+		connBurstIP = flag.Float64("conn-burst-per-ip", 0, "connections a quiet address may start at once, 0 for one second's worth")
+
+		// Credential failures. The broker never sleeps to slow a brute-force run
+		// down: a suspended attempt still holds a socket and three goroutines, so
+		// the waiting would be paid by the broker. It refuses instead, and the
+		// refusal looks exactly like a wrong password — which also means a correct
+		// password from a locked address is refused. On a NAT'd floor of devices
+		// that is a real cost, so nothing here is armed by default.
+		authFailLimit = flag.Int("auth-fail-limit", 0, "credential failures one source address may make inside -auth-fail-window, 0 to keep refusing without waiting")
+		authFailWin   = flag.Duration("auth-fail-window", 0, "how long the credential failures count for; needs -auth-fail-limit")
+		authLockout   = flag.Duration("auth-lockout", 0, "how long a locked address stays refused, 0 for one full window")
+
+		// Where a connection really came from. Behind a load balancer every device
+		// arrives wearing the balancer's address, so the three limits above, the ip
+		// rules and the logs are all decisions about the wrong machine. The PROXY
+		// protocol is how a balancer says whose traffic it is forwarding; reading it
+		// before anything else is what makes those decisions about the device again.
+		proxyMode    = flag.String("proxy-protocol", "off", "read a PROXY protocol header before the payload: off, require (only a balancer may reach these ports) or trusted (believe -trusted-proxy-cidr only)")
+		proxyCIDR    = flag.String("trusted-proxy-cidr", "", "comma separated networks allowed to report another address, e.g. 10.0.0.0/8,fd00::/8; needed by -proxy-protocol trusted")
+		proxyTimeout = flag.Duration("proxy-header-timeout", 5*time.Second, "how long a peer may take to write the transport header")
+
 		// Living with no restart between a decision and its fix.
 		reloadInt = flag.Duration("reload-interval", 2*time.Second, "how often the rule and certificate files are re-checked, 0 for signal-only")
 	)
@@ -79,6 +109,97 @@ func main() {
 	// operator did not ask for.
 	if *maxQoS < 1 || *maxQoS > 2 {
 		os.Stderr.WriteString("-max-qos must be 1 or 2 (0 means the default of 2)\n")
+		os.Exit(2)
+	}
+	// The same reasoning: a negative limit is neither the default nor a limit, and
+	// treating it as "off" would let a typo read back as a deliberate choice.
+	if *maxConnsIP < 0 || *connRateIP < 0 || *connBurstIP < 0 {
+		os.Stderr.WriteString("-max-conns-per-ip, -conn-rate-per-ip and -conn-burst-per-ip are limits; 0 turns each one off\n")
+		os.Exit(2)
+	}
+	// The same for -max-subs: a negative cap would read back as "unlimited", which
+	// is the opposite of the sentence "-1" was typed to mean.
+	if *maxSubs < 0 {
+		os.Stderr.WriteString("-max-subs is a limit; 0 means unlimited\n")
+		os.Exit(2)
+	}
+	// -conn-burst-per-ip sizes the bucket that -conn-rate-per-ip fills. Set on its
+	// own it would be a number no code reads, which is the one thing a limit flag
+	// must never be mistaken for.
+	if *connBurstIP > 0 && *connRateIP == 0 {
+		os.Stderr.WriteString("-conn-burst-per-ip needs -conn-rate-per-ip: burst is the size of the rate window\n")
+		os.Exit(2)
+	}
+	if *authFailLimit < 0 || *authFailWin < 0 || *authLockout < 0 {
+		os.Stderr.WriteString("-auth-fail-limit, -auth-fail-window and -auth-lockout are limits; 0 turns the credential lockout off\n")
+		os.Exit(2)
+	}
+	// A failure count with no window to count inside, or a window with nothing to
+	// count, is a limit that never fires. Half a policy is worse than none.
+	if (*authFailLimit > 0) != (*authFailWin > 0) {
+		os.Stderr.WriteString("-auth-fail-limit and -auth-fail-window are a pair: a failure count needs the window it counts in\n")
+		os.Exit(2)
+	}
+	if *authLockout > 0 && *authFailLimit == 0 {
+		os.Stderr.WriteString("-auth-lockout needs -auth-fail-limit and -auth-fail-window: nothing would ever be locked out\n")
+		os.Exit(2)
+	}
+	// The other half of the same trap: with no auth file every credential is
+	// accepted, so there is no failure to count and the lockout never fires.
+	if *authFailLimit > 0 && *authPath == "" {
+		os.Stderr.WriteString("-auth-fail-limit needs -auth: without an auth file every credential is accepted\n")
+		os.Exit(2)
+	}
+
+	// The transport header. A word that is not one of the three modes is not a
+	// typo to be guessed at: "yes" would have to mean either "believe whoever sends
+	// a header" or "only believe the list", and those are opposite answers.
+	var proxy broker.ProxyMode
+	switch *proxyMode {
+	case "off":
+		proxy = broker.ProxyOff
+	case "require":
+		proxy = broker.ProxyRequire
+	case "trusted":
+		proxy = broker.ProxyTrusted
+	default:
+		os.Stderr.WriteString("-proxy-protocol must be off, require or trusted\n")
+		os.Exit(2)
+	}
+	// trusted with no list believes nobody, so every header gets refused and the
+	// broker is an endpoint that only closes connections. That is not a conservative
+	// reading of the flag, it is a broken one, so it is refused at startup instead.
+	if proxy == broker.ProxyTrusted && *proxyCIDR == "" {
+		os.Stderr.WriteString("-proxy-protocol trusted needs -trusted-proxy-cidr: with no list every header would be refused\n")
+		os.Exit(2)
+	}
+	// require expects a header from every peer and consults no list, so the list is
+	// a number no code reads. Keep the two shapes apart rather than letting an
+	// operator believe the narrower policy was in force.
+	if proxy == broker.ProxyRequire && *proxyCIDR != "" {
+		os.Stderr.WriteString("-trusted-proxy-cidr does nothing with -proxy-protocol require: require believes a header from every address\n")
+		os.Exit(2)
+	}
+	if proxy == broker.ProxyOff {
+		if names := proxyGiven(); len(names) > 0 {
+			os.Stderr.WriteString("-proxy-protocol is off, so these flags would do nothing: " +
+				strings.Join(names, ", ") + "\n")
+			os.Exit(2)
+		}
+	}
+	var proxies []netip.Prefix
+	if *proxyCIDR != "" {
+		p, err := broker.ParsePrefixes(*proxyCIDR)
+		if err != nil {
+			os.Stderr.WriteString("-trusted-proxy-cidr: " + err.Error() + "\n")
+			os.Exit(2)
+		}
+		proxies = p
+	}
+	// A zero timeout is a deadline that has already passed, which would close every
+	// connection before the header is read. It is not a way to say "no limit".
+	if proxy != broker.ProxyOff && *proxyTimeout <= 0 {
+		os.Stderr.WriteString("-proxy-header-timeout must be positive; it bounds a read, and 0 would fail every connection\n")
 		os.Exit(2)
 	}
 
@@ -118,6 +239,7 @@ func main() {
 		InflightWindow: *window,
 		MailboxSize:    *mailbox,
 		MaxConns:       *maxConns,
+		MaxSubs:        *maxSubs,
 		RetryInterval:  *retry,
 		WriteTimeout:   *writeTO,
 		DeliverTimeout: *deliverTO,
@@ -132,6 +254,18 @@ func main() {
 
 		TLSConfig:        tlsCfg,
 		HandshakeTimeout: *tlsHandshake,
+
+		MaxConnsPerIP:     *maxConnsIP,
+		ConnectRatePerIP:  *connRateIP,
+		ConnectBurstPerIP: *connBurstIP,
+
+		AuthFailLimit:  *authFailLimit,
+		AuthFailWindow: *authFailWin,
+		AuthLockout:    *authLockout,
+
+		Proxy:              proxy,
+		TrustedProxies:     proxies,
+		ProxyHeaderTimeout: *proxyTimeout,
 	}
 	// A rule file that will not parse is never ignored: half a policy is worse
 	// than no policy, so the operator fixes it before anything connects.
@@ -282,6 +416,22 @@ func logStore(log *slog.Logger, fs *store.FileStore, sync string) {
 		"sessions", len(fs.Sessions()),
 		"retained", len(fs.LoadRetained()),
 		"wills", len(fs.LoadWills()))
+}
+
+// proxyGiven names the transport-header flags set on the command line, other than
+// the switch that turns the feature on. With -proxy-protocol off they are numbers
+// no code reads, and the worse outcome than not setting them is setting them and
+// believing they did something.
+func proxyGiven() []string {
+	var names []string
+	flag.Visit(func(f *flag.Flag) {
+		switch f.Name {
+		case "trusted-proxy-cidr", "proxy-header-timeout":
+			names = append(names, "-"+f.Name)
+		}
+	})
+	slices.Sort(names)
+	return names
 }
 
 func newLogger(level string) *slog.Logger {

@@ -9,6 +9,7 @@
 //	bin/congmq-load -mode pump  -publishers 20 -offline 500 -qos 1 -seconds 20
 //	bin/congmq-load -mode pump  -addr 127.0.0.1:8883 -tls -tls-ca pki/ca.crt \
 //	                -tls-client-cert pki/client.crt -tls-client-key pki/client.key
+//	bin/congmq-load -mode conns -conns 3000 -proxy-header v2 -proxy-src 203.0.113.7,198.51.100.9
 //
 // conns answers "what does an idle connection cost", pump answers "how many
 // messages per second, at what latency, and what does durable queueing add".
@@ -29,9 +30,12 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/netip"
 	"os"
 	"runtime"
 	"sort"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -69,7 +73,133 @@ var (
 	tlsCert = flag.String("tls-client-cert", "", "PEM client certificate for a broker started with -tls-ca")
 	tlsKey  = flag.String("tls-client-key", "", "PEM private key matching -tls-client-cert")
 	tlsName = flag.String("tls-server-name", "", "name the broker certificate is verified against; the -addr host is used when empty")
+
+	// The transport header. A broker started with -proxy-protocol require closes
+	// every connection that does not open with one, so the shape worth measuring
+	// needs a client that writes it — which is exactly what the load balancer in
+	// front of that broker is doing.
+	proxyHdr = flag.String("proxy-header", "none", "write a PROXY protocol header before the CONNECT: none, v1 (text) or v2 (binary)")
+	proxySrc = flag.String("proxy-src", "", "source addresses the header claims, comma separated and cycled per connection; empty means this socket's own address")
 )
+
+// The header to write, resolved once at startup so dial() does no parsing.
+const (
+	proxyNone = iota
+	proxyV1
+	proxyV2
+)
+
+var (
+	proxyForm  int
+	proxyClaim []netip.Addr
+	proxySeq   atomic.Uint64
+)
+
+// buildProxy turns the two header flags into what dial() needs, and refuses the
+// combinations that would silently measure a different run than the one asked for
+// — the same discipline the broker applies to its own flags.
+func buildProxy() {
+	switch *proxyHdr {
+	case "none", "":
+		proxyForm = proxyNone
+	case "v1":
+		proxyForm = proxyV1
+	case "v2":
+		proxyForm = proxyV2
+	default:
+		exitf("-proxy-header must be none, v1 or v2")
+	}
+	if *proxySrc == "" {
+		return
+	}
+	if proxyForm == proxyNone {
+		exitf("-proxy-src does nothing without -proxy-header: with no header there is nobody to claim an address")
+	}
+	for _, item := range strings.Split(*proxySrc, ",") {
+		item = strings.TrimSpace(item)
+		if item == "" {
+			exitf("-proxy-src has an empty entry")
+		}
+		a, err := netip.ParseAddr(item)
+		if err != nil {
+			exitf("-proxy-src %q: %v", item, err)
+		}
+		proxyClaim = append(proxyClaim, a)
+	}
+}
+
+// proxyHeader lays the header out the way the specification fixes it, from the
+// socket that is about to carry it. The destination is the broker's own address
+// and the source is either the claimed one or this socket's, because a real L4
+// proxy reports what it saw on the client side and nothing else.
+func proxyHeader(conn net.Conn) []byte {
+	if proxyForm == proxyNone {
+		return nil
+	}
+	n := proxySeq.Add(1) - 1
+	src, sport := socketAddr(conn.LocalAddr())
+	if len(proxyClaim) > 0 {
+		src = proxyClaim[int(n%uint64(len(proxyClaim)))]
+		// A claimed device needs a claimed port, and it has to vary: a session is
+		// a four-tuple, and a log line that repeats one port for ten thousand
+		// devices is a log line nobody can read.
+		sport = uint16(20000 + n%40000)
+	}
+	dst, dport := socketAddr(conn.RemoteAddr())
+	if dst.Is4() != src.Is4() {
+		// The families have to agree — a v2 header carries one family for both
+		// addresses. This only happens when a claim list mixes families against a
+		// single-stack broker, so the fallback is the same-family wildcard.
+		if src.Is4() {
+			dst = netip.AddrFrom4([4]byte{0, 0, 0, 0})
+		} else {
+			dst = netip.AddrFrom16([16]byte{})
+		}
+	}
+
+	if proxyForm == proxyV1 {
+		fam := "TCP4"
+		if !src.Is4() {
+			fam = "TCP6"
+		}
+		return []byte(fmt.Sprintf("PROXY %s %s %s %d %d\r\n", fam, src, dst, sport, dport))
+	}
+
+	addrLen := 16
+	famByte := byte(0x21) // AF_INET6, STREAM
+	if src.Is4() {
+		addrLen, famByte = 4, 0x11 // AF_INET, STREAM
+	}
+	body := make([]byte, addrLen*2+4)
+	copy(body[0:addrLen], src.AsSlice())
+	copy(body[addrLen:2*addrLen], dst.AsSlice())
+	binary.BigEndian.PutUint16(body[2*addrLen:], sport)
+	binary.BigEndian.PutUint16(body[2*addrLen+2:], dport)
+	head := make([]byte, 0, len(v2Sig)+4+len(body))
+	head = append(head, v2Sig...)
+	head = append(head, 0x21, famByte) // version 2 + command PROXY, then family + STREAM
+	head = binary.BigEndian.AppendUint16(head, uint16(len(body)))
+	return append(head, body...)
+}
+
+// v2Sig is the twelve-byte signature every PROXY protocol v2 header starts with.
+const v2Sig = "\r\n\r\n\x00\r\nQUIT\n"
+
+// socketAddr splits a net.Addr into the two numbers a header needs. Anything that
+// does not carry an IP (a unix socket, in principle) reports itself as the v4
+// wildcard rather than failing the dial: the loader is not the peer being judged.
+func socketAddr(a net.Addr) (netip.Addr, uint16) {
+	host, port, err := net.SplitHostPort(a.String())
+	if err != nil {
+		return netip.AddrFrom4([4]byte{0, 0, 0, 0}), 0
+	}
+	ip, err := netip.ParseAddr(host)
+	if err != nil {
+		return netip.AddrFrom4([4]byte{0, 0, 0, 0}), 0
+	}
+	p, _ := strconv.Atoi(port)
+	return ip.Unmap(), uint16(p)
+}
 
 // clientTLS is nil when -tls is off, so dial() does not branch on the flag.
 var clientTLS *tls.Config
@@ -84,6 +214,7 @@ func main() {
 		exitf("-payload must be at least 16 bytes: that stamp is what latency is measured from")
 	}
 	buildTLS()
+	buildProxy()
 
 	sample := newSampler(*metrics)
 	before := sample.get()
@@ -283,6 +414,15 @@ func dial(id string, spreadIndex int) (*client, error) {
 	if tc, ok := conn.(*net.TCPConn); ok {
 		_ = tc.SetNoDelay(true)
 	}
+	// The header goes on the socket, outside TLS: that is where a load balancer
+	// writes it, and a broker that reads it before the handshake is a broker this
+	// loader could not otherwise reach.
+	if hdr := proxyHeader(conn); len(hdr) > 0 {
+		if _, err := conn.Write(hdr); err != nil {
+			_ = conn.Close()
+			return nil, fmt.Errorf("write transport header: %w", err)
+		}
+	}
 	if clientTLS != nil {
 		sc := tls.Client(conn, clientTLS)
 		if err := sc.Handshake(); err != nil {
@@ -338,17 +478,27 @@ func buildTLS() {
 // a TLS baseline row comparable to the plain one next to it. The version comes
 // from the first handshake, so a run that negotiated down to 1.2 says so.
 func transportLabel() string {
-	if !*tlsOn {
-		return "tcp"
+	base := "tcp"
+	if *tlsOn {
+		switch clientTLSVersion.Load() {
+		case tls.VersionTLS13:
+			base = "tls1.3"
+		case tls.VersionTLS12:
+			base = "tls1.2"
+		default:
+			base = "tls"
+		}
 	}
-	switch clientTLSVersion.Load() {
-	case tls.VersionTLS13:
-		return "tls1.3"
-	case tls.VersionTLS12:
-		return "tls1.2"
-	default:
-		return "tls"
+	// The header form belongs in the label for the same reason the TLS version
+	// does: two rows that differ only in what they wrote in front of the CONNECT
+	// have to say so in the row itself.
+	switch proxyForm {
+	case proxyV1:
+		return base + "+proxyv1"
+	case proxyV2:
+		return base + "+proxyv2"
 	}
+	return base
 }
 
 func (c *client) send(p packets.Packet) error {
