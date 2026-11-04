@@ -60,7 +60,7 @@ jobs:
   conformance:
     name: third-party client / ubuntu
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
 
@@ -82,6 +82,29 @@ jobs:
       - name: install the harness (mqtt.js only)
         working-directory: test
         run: npm ci --no-audit --no-fund
+
+      # 互操作矩阵靠的是第三家实现（Eclipse paho.mqtt.python），所以这里必须装一份。
+      # 版本钉死：paho 自己改一次默认行为——比如 clean_start 的语义——我们那 54 条断言
+      # 会一夜之间全变味，那不再是 broker 的失败而是 harness 的。
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: install paho for the interop matrix
+        run: python -m pip install --quiet --disable-pip-version-check paho-mqtt==2.1.0
+
+      # 跨版本滚动升级需要**两个**二进制：当前构建 + 老 tag 那份。actions/checkout 的
+      # 浅克隆默认不带 tag，所以只把 v1.0.0 单独拉下来（`--depth 1` 就够，我们不需要
+      # 中间的提交图，只需要那一个 tree）。老版本没有闸门、没有 PROXY、没有抗滥用，
+      # 但 record.go 与当前**零字节差异**——这才是"接管"这句话真正在测的东西。
+      - name: build the v1.0.0 binary the successor has to take over from
+        run: |
+          set -euo pipefail
+          git fetch --depth 1 origin tag v1.0.0
+          mkdir -p .tmp/v1000
+          git archive v1.0.0 | tar -x -C .tmp/v1000
+          (cd .tmp/v1000 && go build -trimpath -o ../../.tmp/congmq-v1000 ./cmd/congmq)
+          .tmp/congmq-v1000 -version
 
       # The first three scripts talk to a broker somebody else started, each with
       # different flags, so each gets its own broker and it dies with the step.
@@ -129,6 +152,28 @@ jobs:
       # an outside writer can show the bytes are the ones a real load balancer sends.
       - name: proxy-check.mjs (PROXY protocol v1/v2, trusted proxy list)
         run: (cd test && node proxy-check.mjs)
+
+      # 三家外部客户端之一：paho.mqtt.python 打 3.1.1 与 5.0 全路径，逐条对 reason code。
+      # 上面 conformance.mjs 用的是 mqtt.js（Node 侧），这里补一份"另一种语言的客户端也认"；
+      # 只用自己写的客户端不构成契约证据——自己写的会跟着 broker 的偏好漂移。
+      - name: interop-check.mjs (Eclipse paho.mqtt.python 54 条契约)
+        run: (cd test && node interop-check.mjs)
+
+      # 冷备份 → 恢复演练：另一路径上的拷贝起 broker；第二腿故意拷"备份时仍在写"的文件并
+      # 中途截断——它必须**大声降级**（bytes_discarded 非零）而不是静默少东西。
+      - name: restore-drill.mjs (冷备份 → 恢复 + 截断大声降级)
+        run: (cd test && node restore-drill.mjs)
+
+      # 跨版本滚动升级 + 单写者闸门：v1.0.0 与当前在同一 -store 目录同一端口下双向接管，
+      # 第三条腿量"新进程抢在旧进程之前起"——那个升级时的手误现在被 exit 1 拒绝，而
+      # v1.0.0 那边看不到闸门（STARTED anyway）。这条 harness 需要 CONGMQ_OLD_BIN 指到
+      # 上一步 build 出来的 .tmp/congmq-v1000；默认路径已经对得上，这里显式写一次，
+      # 免得以后 harness 改了默认值 CI 静默不测。
+      - name: rolling-upgrade.mjs (v1.0.0 双向接管 + 单写者闸门)
+        env:
+          CONGMQ_BIN: ${{ github.workspace }}/bin/congmq
+          CONGMQ_OLD_BIN: ${{ github.workspace }}/.tmp/congmq-v1000
+        run: (cd test && node rolling-upgrade.mjs)
 
   # The deployment shape, run for real. Nothing above exercises Dockerfile,
   # deploy/docker-compose.yml or the nginx config — they are text until something

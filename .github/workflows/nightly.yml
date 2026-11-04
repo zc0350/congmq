@@ -1,0 +1,67 @@
+name: nightly
+
+# 浸泡判据是**同等负载谷底之间的堆斜率**，不是收尾那一眼：HeapAlloc 是上一次 GC 那一刻
+# 的活对象快照，空载的 runtime 没理由回收，收尾读数会一直报洪峰。这条 harness 默认十分钟，
+# 加冷启动与四类负载轮换实际七分钟左右——每个 PR 都跑一次划不来，所以放这里每天跑一次。
+# 想手动跑：Actions 页面 → Nightly → Run workflow（workflow_dispatch 那条），
+# 或者 `gh workflow run nightly.yml`。
+
+on:
+  schedule:
+    # 17 18 UTC ≈ 02:17 北京——GitHub runner 池一天里最平静的档，也是没人等 CI 的档。
+    - cron: '17 18 * * *'
+  workflow_dispatch:
+    inputs:
+      minutes:
+        description: soak 时长（分钟），默认走 harness 里的 10
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  # 同一个 nightly 只跑一份；新触发把旧的取消。手动跑不共享这个组，避免撞车。
+  group: nightly-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  soak:
+    name: 浸泡（四类负载轮换 + 会话 churn）
+    runs-on: ubuntu-latest
+    # harness 默认 10 分钟；把 minutes 拉到 30 也没超本 job 的 30 分钟。
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: build the two binaries soak needs
+        run: |
+          go build -trimpath -o bin/congmq ./cmd/congmq
+          go build -trimpath -o bin/congmq-load ./cmd/congmq-load
+
+      - name: install the harness (mqtt.js only)
+        working-directory: test
+        run: npm ci --no-audit --no-fund
+
+      # 报告写进 test/soak-<run>.md，上传成 artifact。跑挂了也上传：
+      # 判据本身就是"看堆斜率"，报告是唯一能翻回来看的东西。
+      - name: soak-check.mjs
+        env:
+          CONGMQ_SOAK_MINUTES: ${{ github.event.inputs.minutes }}
+        run: (cd test && node soak-check.mjs --out="soak-${GITHUB_RUN_ID}.md")
+
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: soak-report
+          path: test/soak-*.md
+          if-no-files-found: warn

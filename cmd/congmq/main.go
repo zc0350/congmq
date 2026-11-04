@@ -20,7 +20,7 @@ import (
 )
 
 // The release workflow refuses to publish when this and the git tag disagree.
-const version = "1.1.0"
+const version = "1.1.1"
 
 func main() {
 	var (

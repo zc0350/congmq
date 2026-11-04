@@ -771,18 +771,24 @@ load-baseline --groups=proxy  6/6 行跑完；自检 6/6 行 connect_errors 被 
 Go 侧 `gofmt -l` 无输出、`go vet ./...` 干净、`go test -count=1 ./...` 全绿（broker 41.9s）。
 
 这一层不用人守着：`.github/workflows/build.yml` 在每次 push 与 PR 上跑 `gofmt`、`go vet`、
-`go test`（ubuntu 与 windows 两个系统），再在 ubuntu 上把上面八个 Node 脚本（`lb-smoke` 除外，
-它要的是一个已经在跑的前置）逐个跑一遍；另有一个 `docker` job 把部署形态本身跑一遍——
-`docker build`、镜像里的 `-version` 必须等于源码里的 `const version`、`id` 必须是 `uid=10001`、
-`docker compose up --build` 起 nginx→broker、然后用**真的 mqtt.js 客户端穿过真的 nginx** 打一轮
-（`lb-smoke`），再核对 `connections_over_proxy_header` 因为这一轮而涨、`refused_over_proxy_header`
-一个没动，最后原地重启容器并确认 `state.log` 还在命名卷里。交叉编译与 Release 挂在
-`needs: [go, conformance, docker]` 之后：镜像起不来就不该有 Release。
+`go test`（ubuntu 与 windows 两个系统），再在 ubuntu 上把上面十一个 Node 脚本（`lb-smoke` 与
+`soak` 除外，前者要的是一个已经在跑的前置、后者要的是十分钟的堆斜率窗口）逐个跑一遍——为此
+`conformance` job 还多带了两步准备：`setup-python` + `paho-mqtt==2.1.0`（互操作矩阵跑的是
+第三家实现，不是自己写的客户端），以及 `git fetch --depth 1 origin tag v1.0.0` + `git archive
+v1.0.0 | tar -x -C .tmp/v1000 && go build` 造一份 v1.0.0 二进制（`rolling-upgrade` 双向接管与
+单写者闸门第三条腿都靠它，浅克隆默认不带 tag 所以只能显式拉）。另有一个 `docker` job 把部署
+形态本身跑一遍——`docker build`、镜像里的 `-version` 必须等于源码里的 `const version`、`id`
+必须是 `uid=10001`、`docker compose up --build` 起 nginx→broker、然后用**真的 mqtt.js 客户端
+穿过真的 nginx** 打一轮（`lb-smoke`），再核对 `connections_over_proxy_header` 因为这一轮而涨、
+`refused_over_proxy_header` 一个没动，最后原地重启容器并确认 `state.log` 还在命名卷里。
+交叉编译与 Release 挂在 `needs: [go, conformance, docker]` 之后：镜像起不来就不该有 Release。
 推 `v*` tag 时额外交叉编译六个平台，把归档与 `SHA256SUMS.txt` 挂到 Release；归档里除了二进制还带
 `Dockerfile`、`deploy/`（compose + nginx + systemd 两个单元文件）与 `LICENSE`。
 **tag 与 `cmd/congmq/main.go` 里的 `const version` 不一致就直接失败**——发出去的版本号必须等于
-二进制 `-version` 打印的那一个，宁可不发。`load-baseline` 不在 CI 里：基准必须在目标机器上跑，
-runner 的核数与磁盘不是你的机队会落到的地方。
+二进制 `-version` 打印的那一个，宁可不发。`soak` 单独住在 `.github/workflows/nightly.yml`
+（`schedule: 17 18 * * *` UTC ≈ 北京 02:17 + `workflow_dispatch` 手动入口），报告作为 artifact
+上传；`load-baseline` 不在 CI 里：基准必须在目标机器上跑，runner 的核数与磁盘不是你的机队会
+落到的地方。
 其中 TLS 那 12 个用例是这一层的重点：`tls_test.go` 7 个（两个端口互不干扰、明文打到 TLS 端口、
 只有 TLS 端口的形态、握手失败不变成会话、静默对端拖不住 accept、需要并校验客户端证书、
 验证过的 CN 在任何会话建立之前就已在 broker 手里），`cert_test.go` 5 个（证书即凭据、明文端口答不出
